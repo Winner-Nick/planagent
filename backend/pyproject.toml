@@ -11,6 +11,8 @@ dependencies = [
   "fastapi>=0.115",
   "uvicorn[standard]>=0.32",
   "sqlalchemy>=2.0",
+  "aiosqlite>=0.20",
+  "greenlet>=3.0",
   "alembic>=1.13",
   "pydantic>=2.9",
   "pydantic-settings>=2.6",
@@ -41,6 +43,7 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+extend-ignore = ["B008"]  # FastAPI uses Depends(...) / Query(...) in defaults
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
