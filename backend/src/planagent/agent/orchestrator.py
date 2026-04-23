@@ -669,8 +669,11 @@ async def handle_inbound(
         speaker_wechat_user_id=speaker_user_id,
     )
     # PR-H: assemble whiteboard with unconsumed peer→speaker notes + peer
-    # activity snapshot. Notes are marked consumed AFTER make_prompt so a
-    # crash mid-prompt doesn't silently lose them.
+    # activity snapshot. Consumption is deferred to AFTER a successful
+    # outbound flush (see end of handler) — if DeepSeek or the transport
+    # raises, the notes must remain unread so the next turn resurfaces
+    # them. Losing cross-user context silently would be a worse failure
+    # than redelivering a nudge.
     whiteboard, consumable_note_ids = await _build_whiteboard(
         session_factory,
         group_id=group_internal_id,
@@ -680,7 +683,6 @@ async def handle_inbound(
     snapshot.whiteboard = whiteboard
     now = datetime.now(SHANGHAI)
     system_prompt = make_prompt(snapshot, now=now)
-    await _mark_notes_consumed(session_factory, note_ids=consumable_note_ids)
 
     history = await _load_history_for_speaker(
         session_factory,
@@ -802,6 +804,14 @@ async def handle_inbound(
     sent = await deferred.flush()
     if sent is not None:
         ctx.sent_texts.append(sent)
+
+    # Only NOW mark whiteboard notes consumed — if we got here, the turn
+    # has reached a terminal state (either `sent` is non-None or the LLM
+    # opted to stay silent). Any exception from the loop or flush would
+    # have propagated before this line, preserving the unread notes for
+    # a retry on the next inbound.
+    if consumable_note_ids:
+        await _mark_notes_consumed(session_factory, note_ids=consumable_note_ids)
 
 
 __all__ = ["FALLBACK_TEXT", "MAX_ROUNDS", "handle_inbound"]
