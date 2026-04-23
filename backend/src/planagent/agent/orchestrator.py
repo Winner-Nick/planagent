@@ -77,7 +77,7 @@ from planagent.wechat.protocol import InboundMessage
 
 log = logging.getLogger(__name__)
 
-MAX_ROUNDS = 6
+MAX_ROUNDS = 10
 HISTORY_TURNS = 20
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -379,6 +379,16 @@ class _DeferredSender:
         stripped = text.strip()
         if not stripped:
             return
+        # Dedup: if the new text is contained in a previous one (or vice
+        # versa), keep only the longer. Without this, the LLM sometimes
+        # calls ask_user_in_group twice with near-duplicate wording and
+        # the user sees the same question asked twice.
+        for i, prev in enumerate(self._buffer):
+            if stripped in prev:
+                return
+            if prev in stripped:
+                self._buffer[i] = stripped
+                return
         self._buffer.append(stripped)
 
     @property
@@ -392,6 +402,18 @@ class _DeferredSender:
         merged = _SEND_MERGE_SEPARATOR.join(self._buffer)
         await self._underlying(merged)
         return merged
+
+    async def fallback(self, text: str) -> None:
+        """Queue a fallback message ONLY when the buffer is empty.
+
+        When the agent produces any visible output, we don't want to trail
+        it with an operator-facing "我需要人看一下" blurb. The fallback
+        exists to make sure silent failures don't look like the bot froze;
+        it shouldn't stomp on a real reply.
+        """
+        if self._buffer:
+            return
+        await self(text)
 
 
 async def handle_inbound(
@@ -532,9 +554,10 @@ async def handle_inbound(
             await deferred(content)
         break
     else:
-        # Ran out of rounds. Ensure the user sees a single coherent message.
+        # Ran out of rounds. Only surface a fallback if nothing was spoken
+        # yet — a real partial reply is strictly better than boilerplate.
         log.warning("agent hit MAX_ROUNDS=%d without terminating", max_rounds)
-        await deferred(FALLBACK_TEXT)
+        await deferred.fallback(FALLBACK_TEXT)
         await _append_turn(
             session_factory,
             group_id=group_internal_id,
