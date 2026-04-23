@@ -48,8 +48,16 @@ def display_name_for(wechat_user_id: str | None) -> str | None:
 
 
 def peer_wechat_user_id(speaker_wechat_user_id: str | None) -> str | None:
-    """Return the other known human's wechat_user_id, or None if ambiguous."""
+    """Return the other known human's wechat_user_id, or None if unrecognized.
+
+    When the speaker isn't in the known roster (unexpected user / misconfig /
+    future deployment), do NOT fall back to the first known human — that
+    would silently assign plans to the wrong person on `owner="peer"`.
+    """
     if not speaker_wechat_user_id:
+        return None
+    # Must recognize the speaker before we can name a peer.
+    if speaker_wechat_user_id not in DISPLAY_NAME_BY_WECHAT_USER_ID:
         return None
     for h in KNOWN_HUMANS:
         if h.wechat_user_id != speaker_wechat_user_id:

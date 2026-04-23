@@ -30,17 +30,55 @@ def upgrade() -> None:
     with op.batch_alter_table("conversation_turns", schema=None) as batch_op:
         batch_op.add_column(sa.Column("target_user_id", sa.String(length=128), nullable=True))
 
-    # Backfill: for rows from PR-F and earlier, the only sensible value is the
-    # speaker itself (user_id). This keeps existing histories visible to the
-    # speaker who made them under the new per-speaker filter.
+    # Backfill target_user_id:
+    # - user rows (role='user') — trivially copy user_id.
+    # - assistant/tool rows — pre-PR-G these were stored with user_id=NULL
+    #   because only speakers carry an id. To keep them visible under the
+    #   new per-speaker history filter, inherit the target_user_id from the
+    #   *most recent preceding user row in the same group* (the speaker this
+    #   assistant/tool reply was addressed to). Without this step, legacy
+    #   assistant turns would silently disappear from prompts on upgrade.
     bind = op.get_bind()
+
+    # Step 1: user rows — trivial copy.
     bind.execute(
         sa.text(
             "UPDATE conversation_turns "
             "SET target_user_id = user_id "
-            "WHERE target_user_id IS NULL"
+            "WHERE target_user_id IS NULL AND role = 'user'"
         )
     )
+
+    # Step 2: assistant/tool rows — walk per group in creation order and
+    # attribute each to the last seen speaker. Done row-by-row here because
+    # SQLite (dev DB) lacks window functions in older versions and this
+    # migration needs to be portable.
+    result = bind.execute(
+        sa.text(
+            "SELECT id, group_id, role, user_id, target_user_id, created_at "
+            "FROM conversation_turns "
+            "ORDER BY group_id, created_at, id"
+        )
+    )
+    last_speaker_by_group: dict[str, str] = {}
+    assign: list[tuple[str, str]] = []
+    for row in result:
+        row_id, group_id, role, user_id, target_user_id, _ = row
+        if role == "user" and user_id:
+            last_speaker_by_group[group_id] = user_id
+            continue
+        if target_user_id is not None:
+            continue
+        speaker = last_speaker_by_group.get(group_id)
+        if speaker:
+            assign.append((speaker, row_id))
+    for speaker, row_id in assign:
+        bind.execute(
+            sa.text(
+                "UPDATE conversation_turns SET target_user_id = :sp WHERE id = :rid"
+            ),
+            {"sp": speaker, "rid": row_id},
+        )
 
     # 2. Create pending_outbound (PR-H storage, defined now so PR-H is schema-stable).
     op.create_table(
