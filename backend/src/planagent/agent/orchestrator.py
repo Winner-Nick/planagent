@@ -537,6 +537,14 @@ async def handle_inbound(
                     target_user_id=speaker_user_id,
                     tool_call_id=tc.id,
                 )
+            # Early termination: if this round included a "spoken" tool
+            # (reply_in_group / ask_user_in_group), the user now has our
+            # reply — giving the LLM another round just burns DeepSeek
+            # latency on a "{sent: true}" result it tends to re-chat about.
+            # See module docstring for why this beats an explicit
+            # end-of-turn prompt rule.
+            if called_spoken_tool:
+                break
             continue
 
         # No tool calls: this is the terminal assistant message.
