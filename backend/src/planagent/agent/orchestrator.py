@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -130,14 +130,20 @@ async def _load_snapshot(
                 .limit(1)
             )
             r = rres.scalar_one_or_none()
+            # SQLite's DateTime(timezone=True) can hand back naive datetimes
+            # depending on driver + version; normalize to UTC before
+            # converting to the conversational tz so the LLM sees correct
+            # times regardless of host TZ.
+            next_fire_local: str | None = None
+            if r is not None and r.fire_at is not None:
+                fa = r.fire_at if r.fire_at.tzinfo is not None else r.fire_at.replace(tzinfo=UTC)
+                next_fire_local = fa.astimezone(SHANGHAI).isoformat()
             plans_out.append(
                 {
                     "id": p.id,
                     "title": p.title,
                     "status": p.status.value,
-                    "next_fire_at": r.fire_at.astimezone(SHANGHAI).isoformat()
-                    if r is not None
-                    else None,
+                    "next_fire_at": next_fire_local,
                 }
             )
 

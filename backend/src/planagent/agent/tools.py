@@ -105,12 +105,29 @@ def _parse_iso_to_utc(value: str) -> datetime:
 # --- Handlers ----------------------------------------------------------------
 
 
+async def _fetch_plan_in_group(session, ctx: ToolContext, plan_id: str) -> Plan | None:
+    """Load a Plan by id only if it belongs to the current group.
+
+    Cross-group reads/writes are treated as 'not found' — in a shared
+    process serving multiple WeChat groups, foreign IDs (from
+    hallucination or prompt injection) must never reach another group's
+    data.
+    """
+    plan = await session.get(Plan, plan_id)
+    if plan is None or plan.group_id != ctx.group_id:
+        return None
+    return plan
+
+
 async def _list_plans(
-    ctx: ToolContext, *, group_id: str | None = None, status: str | None = None
+    ctx: ToolContext, *, status: str | None = None
 ) -> list[dict[str, Any]]:
-    gid = group_id or ctx.group_id
     async with ctx.session_factory() as session:
-        stmt = select(Plan).where(Plan.group_id == gid).order_by(Plan.created_at.desc())
+        stmt = (
+            select(Plan)
+            .where(Plan.group_id == ctx.group_id)
+            .order_by(Plan.created_at.desc())
+        )
         if status is not None:
             stmt = stmt.where(Plan.status == PlanStatus(status))
         res = await session.execute(stmt)
@@ -119,7 +136,7 @@ async def _list_plans(
 
 async def _get_plan(ctx: ToolContext, *, plan_id: str) -> dict[str, Any]:
     async with ctx.session_factory() as session:
-        plan = await session.get(Plan, plan_id)
+        plan = await _fetch_plan_in_group(session, ctx, plan_id)
         if plan is None:
             return {"error": "plan_not_found", "plan_id": plan_id}
         return _serialize_plan(plan)
@@ -129,13 +146,11 @@ async def _create_plan_draft(
     ctx: ToolContext,
     *,
     title: str,
-    group_id: str | None = None,
     owner_user_id: str | None = None,
 ) -> dict[str, Any]:
-    gid = group_id or ctx.group_id
     async with ctx.session_factory() as session:
         plan = Plan(
-            group_id=gid,
+            group_id=ctx.group_id,
             title=title,
             status=PlanStatus.draft,
             owner_user_id=owner_user_id,
@@ -156,7 +171,7 @@ async def _update_plan(
         return {"error": "validation_error", "detail": str(exc)}
     data = update.model_dump(exclude_unset=True)
     async with ctx.session_factory() as session:
-        plan = await session.get(Plan, plan_id)
+        plan = await _fetch_plan_in_group(session, ctx, plan_id)
         if plan is None:
             return {"error": "plan_not_found", "plan_id": plan_id}
         for k, v in data.items():
@@ -173,7 +188,7 @@ async def _update_plan(
 
 async def _mark_plan_complete(ctx: ToolContext, *, plan_id: str) -> dict[str, Any]:
     async with ctx.session_factory() as session:
-        plan = await session.get(Plan, plan_id)
+        plan = await _fetch_plan_in_group(session, ctx, plan_id)
         if plan is None:
             return {"error": "plan_not_found", "plan_id": plan_id}
         plan.status = PlanStatus.completed
@@ -184,7 +199,7 @@ async def _mark_plan_complete(ctx: ToolContext, *, plan_id: str) -> dict[str, An
 
 async def _delete_plan(ctx: ToolContext, *, plan_id: str) -> dict[str, Any]:
     async with ctx.session_factory() as session:
-        plan = await session.get(Plan, plan_id)
+        plan = await _fetch_plan_in_group(session, ctx, plan_id)
         if plan is None:
             return {"error": "plan_not_found", "plan_id": plan_id}
         await session.delete(plan)
@@ -197,7 +212,7 @@ async def _schedule_reminder(
 ) -> dict[str, Any]:
     fire_at_utc = _parse_iso_to_utc(fire_at)
     async with ctx.session_factory() as session:
-        plan = await session.get(Plan, plan_id)
+        plan = await _fetch_plan_in_group(session, ctx, plan_id)
         if plan is None:
             return {"error": "plan_not_found", "plan_id": plan_id}
         rem = Reminder(plan_id=plan_id, fire_at=fire_at_utc, message=message)
@@ -211,6 +226,10 @@ async def _cancel_reminder(ctx: ToolContext, *, reminder_id: str) -> dict[str, A
     async with ctx.session_factory() as session:
         rem = await session.get(Reminder, reminder_id)
         if rem is None:
+            return {"error": "reminder_not_found", "reminder_id": reminder_id}
+        # A reminder belongs to a group via its plan. Enforce ownership.
+        plan = await session.get(Plan, rem.plan_id)
+        if plan is None or plan.group_id != ctx.group_id:
             return {"error": "reminder_not_found", "reminder_id": reminder_id}
         rem.status = ReminderStatus.cancelled
         await session.commit()
@@ -231,7 +250,7 @@ async def _ask_user_in_group(ctx: ToolContext, *, question: str) -> dict[str, An
 
 async def _record_note(ctx: ToolContext, *, plan_id: str, note: str) -> dict[str, Any]:
     async with ctx.session_factory() as session:
-        plan = await session.get(Plan, plan_id)
+        plan = await _fetch_plan_in_group(session, ctx, plan_id)
         if plan is None:
             return {"error": "plan_not_found", "plan_id": plan_id}
         meta = dict(plan.metadata_json or {})
@@ -286,10 +305,6 @@ TOOL_REGISTRY: dict[str, Tool] = {
         parameters_schema={
             "type": "object",
             "properties": {
-                "group_id": {
-                    "type": "string",
-                    "description": "Internal group id. Defaults to the current group.",
-                },
                 "status": {"type": "string", "enum": _PLAN_STATUS_ENUM},
             },
         },
@@ -308,14 +323,14 @@ TOOL_REGISTRY: dict[str, Tool] = {
     "create_plan_draft": Tool(
         name="create_plan_draft",
         description=(
-            "Create a new plan in draft status. Use as soon as you've confirmed "
-            "a plan title; fill remaining fields later via update_plan."
+            "Create a new plan in draft status for the current group. Use as "
+            "soon as you've confirmed a plan title; fill remaining fields "
+            "later via update_plan."
         ),
         parameters_schema={
             "type": "object",
             "properties": {
                 "title": {"type": "string"},
-                "group_id": {"type": "string"},
                 "owner_user_id": {"type": "string"},
             },
             "required": ["title"],
