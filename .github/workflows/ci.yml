@@ -23,9 +23,12 @@ jobs:
       - name: Lint
         working-directory: backend
         run: ruff check src tests
-      - name: Unit tests (no real API calls)
+      - name: Unit tests
         working-directory: backend
-        run: pytest -q -m "not real_api and not real_wechat"
+        # real_api / real_wechat tests auto-skip when their env vars aren't set
+        # (see tests/conftest.py). The integration job below re-runs them with
+        # the secret injected.
+        run: pytest -q
 
   integration:
     runs-on: ubuntu-latest
@@ -43,7 +46,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e '.[dev]'
       - name: Real DeepSeek tests
-        if: ${{ env.DEEPSEEK_API_KEY != '' }}
         working-directory: backend
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
