@@ -15,6 +15,12 @@ from planagent.db.models import GroupContext, Plan, PlanStatus, Reminder
 
 router = APIRouter(prefix="/plans", tags=["plans"])
 
+# Fields that map to NOT NULL columns — PATCH may omit them but must not
+# explicitly null them (would trip IntegrityError → 500 at commit time).
+_NON_NULLABLE_PLAN_FIELDS: frozenset[str] = frozenset(
+    {"title", "status", "priority", "metadata_json"}
+)
+
 
 @router.get("", response_model=list[PlanRead])
 async def list_plans(
@@ -63,6 +69,12 @@ async def update_plan(
     if plan is None:
         raise HTTPException(status_code=404, detail="plan not found")
     data = payload.model_dump(exclude_unset=True)
+    nulled = sorted(k for k, v in data.items() if v is None and k in _NON_NULLABLE_PLAN_FIELDS)
+    if nulled:
+        raise HTTPException(
+            status_code=422,
+            detail=f"fields cannot be null: {nulled}",
+        )
     for k, v in data.items():
         setattr(plan, k, v)
     await session.commit()

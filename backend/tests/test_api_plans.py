@@ -131,6 +131,25 @@ async def test_create_plan_unknown_group_404(client: httpx.AsyncClient) -> None:
     assert r.status_code == 404
 
 
+async def test_patch_rejects_null_on_non_nullable_fields(
+    client: httpx.AsyncClient, group_id: str
+) -> None:
+    r = await client.post(
+        "/api/v1/plans", json={"group_id": group_id, "title": "immortal"}
+    )
+    plan_id = r.json()["id"]
+
+    for field in ("title", "status", "priority", "metadata_json"):
+        r = await client.patch(f"/api/v1/plans/{plan_id}", json={field: None})
+        assert r.status_code == 422, (field, r.text)
+        assert "cannot be null" in r.json()["detail"]
+
+    # Nullable field still accepts null.
+    r = await client.patch(f"/api/v1/plans/{plan_id}", json={"description": None})
+    assert r.status_code == 200
+    assert r.json()["description"] is None
+
+
 async def test_plan_reminders(client: httpx.AsyncClient, group_id: str) -> None:
     from datetime import datetime, timedelta
 
