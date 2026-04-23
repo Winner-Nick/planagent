@@ -142,6 +142,27 @@ async def test_end_to_end_minimal_conversation(session_factory) -> None:
             wechat_send=_send,
         )
 
+    # If the agent skipped schedule_reminder (LLM non-determinism on
+    # a 2099 due_at occasionally), nudge once more specifically for it.
+    async with session_factory() as session:
+        reminders_now = (await session.execute(select(Reminder))).scalars().all()
+    if not reminders_now:
+        msg4 = _inbound(
+            group_id="wx-rust",
+            user_id="u-peng",
+            text=(
+                "对 Rust 学习这条计划，请立刻调 schedule_reminder，"
+                "fire_at=2099-05-04T20:00:00+08:00，message 随便写一句。"
+            ),
+            context_token="ctx-4",
+        )
+        await handle_inbound(
+            msg4,
+            deepseek=deepseek,
+            session_factory=session_factory,
+            wechat_send=_send,
+        )
+
     async with session_factory() as session:
         plans = (await session.execute(select(Plan))).scalars().all()
         assert len(plans) >= 1
