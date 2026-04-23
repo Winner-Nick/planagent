@@ -82,9 +82,21 @@ async def _stamp_session_inbound(
         bs.last_inbound_at = now_utc
         if msg.context_token:
             bs.last_context_token = msg.context_token
-        # First-inbound learning: capture wechat_user_id + bot_user_id.
+        # Capture wechat_user_id + bot_user_id from inbound. Inbound is
+        # ALWAYS the authoritative source — if bootstrap seeded a wrong id
+        # from a stale roster / cred filename, real traffic self-heals by
+        # overwriting it. We log the correction so misconfig is visible.
         from_user = wxp.sender_id(msg) or msg.from_user_id
-        if bs.wechat_user_id is None and from_user:
+        if from_user and bs.wechat_user_id != from_user:
+            if bs.wechat_user_id:
+                import logging as _log
+                _log.getLogger(__name__).warning(
+                    "bot_session %s: correcting wechat_user_id %s -> %s "
+                    "(bootstrap seed differed from real inbound)",
+                    bs.id,
+                    bs.wechat_user_id,
+                    from_user,
+                )
             bs.wechat_user_id = from_user
             # Fold the same value into the matching GroupMember row so the
             # orchestrator's snapshot sees it immediately. PR-G preferred

@@ -71,6 +71,10 @@ def load_all_sessions(cred_dir: Path | None = None) -> list[SessionCredential]:
 
     Sorted by name for deterministic iteration order (matters for tests that
     observe which session is "first" in a scheduler tick).
+
+    Files whose stem contains ".old" (e.g. `peng.old.135126.json`, used as
+    a manual backup when re-scanning) are skipped — including them would
+    spawn a stale BotSession row with a dead token.
     """
     d = cred_dir or CRED_DIR
     if not d.is_dir():
@@ -80,6 +84,9 @@ def load_all_sessions(cred_dir: Path | None = None) -> list[SessionCredential]:
         if not path.is_file() or path.suffix != ".json":
             continue
         if path.stem in _IGNORED_STEMS:
+            continue
+        if ".old" in path.stem:
+            log.info("skipping backup cred file %s", path.name)
             continue
         cred = _parse_cred_file(path)
         if cred is not None:
@@ -136,18 +143,29 @@ async def sync_sessions_to_db(
             elif row.display_name != human.display_name:
                 row.display_name = human.display_name
 
+        # Build a lookup: cred.name → known_human so we can pre-seed the
+        # BotSession with its wechat_user_id. Without this seeding the
+        # scheduler has to wait for that user's first inbound before it can
+        # fan reminders/nudges to them — which silently drops any reminder
+        # intended for a user who hasn't spoken in this bridge's lifetime
+        # (observed bug: a "tell 辰辰..." reminder scheduled before she ever
+        # messaged the new bridge never fired).
+        known_by_cred = {h.cred_name: h for h in KNOWN_HUMANS}
+
         out_ids: list[str] = []
         for cred in creds:
             bres = await session.execute(
                 select(BotSession).where(BotSession.name == cred.name)
             )
             bs = bres.scalar_one_or_none()
+            seeded = known_by_cred.get(cred.name)
             if bs is None:
                 bs = BotSession(
                     group_id=group.id,
                     name=cred.name,
                     bot_token=cred.bot_token,
                     baseurl=cred.baseurl,
+                    wechat_user_id=(seeded.wechat_user_id if seeded else None),
                 )
                 session.add(bs)
                 await session.flush()
@@ -155,6 +173,8 @@ async def sync_sessions_to_db(
                 bs.bot_token = cred.bot_token
                 if cred.baseurl is not None:
                     bs.baseurl = cred.baseurl
+                if seeded and not bs.wechat_user_id:
+                    bs.wechat_user_id = seeded.wechat_user_id
                 # Keep existing group linkage; don't reparent.
             out_ids.append(bs.id)
 

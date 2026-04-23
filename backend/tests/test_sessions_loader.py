@@ -106,3 +106,39 @@ async def test_bootstrap_service_scans_dir(sm, tmp_path) -> None:
     async with sm() as session:
         count = len((await session.execute(select(BotSession))).scalars().all())
         assert count == 2
+
+
+def test_load_skips_old_backup_files(tmp_path) -> None:
+    """Historical `*.old.*` backups (left behind by earlier re-scans) must
+    NOT spawn a third BotSession row with a dead token — otherwise the
+    scheduler picks them up and tries to long-poll against an invalidated
+    credential, polluting logs and the DB.
+    """
+    _write(tmp_path, "peng", {"bot_token": "tok-p"})
+    _write(tmp_path, "chenchen", {"bot_token": "tok-c"})
+    _write(tmp_path, "peng.old.135126", {"bot_token": "tok-dead"})
+    _write(tmp_path, "chenchen.old.1", {"bot_token": "tok-dead"})
+    creds = load_all_sessions(cred_dir=tmp_path)
+    assert sorted(c.name for c in creds) == ["chenchen", "peng"]
+
+
+async def test_bootstrap_seeds_bot_session_wechat_user_id(sm) -> None:
+    """Known-human sessions get their wechat_user_id pre-filled on bootstrap,
+    so the scheduler can deliver reminders to them BEFORE they've sent their
+    first inbound to this bridge. Without this, a "remind 辰辰 at …" scheduled
+    right after startup was silently dropped whenever she hadn't messaged yet.
+    """
+    creds = [
+        SessionCredential(name="peng", bot_token="tok-p", baseurl=None),
+        SessionCredential(name="chenchen", bot_token="tok-c", baseurl=None),
+    ]
+    await sync_sessions_to_db(sm, creds)
+    async with sm() as session:
+        sessions_rows = (await session.execute(select(BotSession))).scalars().all()
+        by_name = {s.name: s for s in sessions_rows}
+        assert by_name["peng"].wechat_user_id == (
+            "o9cq807dznGxf81R2JoVl2pEx_T0@im.wechat"
+        )
+        assert by_name["chenchen"].wechat_user_id == (
+            "o9cq80ydQIR4ZaYl6vXvDp_4KklQ@im.wechat"
+        )
