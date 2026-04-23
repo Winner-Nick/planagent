@@ -52,6 +52,7 @@ class GroupContext(Base):
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_context_token: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     members: Mapped[list[GroupMember]] = relationship(
         back_populates="group", cascade="all, delete-orphan"
