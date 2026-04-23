@@ -190,3 +190,33 @@ def test_build_headers_omits_authorization_when_token_empty() -> None:
     assert "Authorization" not in h
     assert h["AuthorizationType"] == "ilink_bot_token"
     assert "X-WECHAT-UIN" in h
+
+
+def test_outbound_message_has_unique_client_id() -> None:
+    """Regression: ClawBot silently de-duplicates consecutive sends that
+    share a client_id (or omit it). OutboundMessage must default to a
+    fresh id per instance.
+    """
+    from planagent.wechat.protocol import (
+        ITEM_TYPE_TEXT,
+        OutboundItem,
+        OutboundMessage,
+        TextItemPayload,
+        dump_outbound,
+    )
+
+    def _make():
+        return OutboundMessage(
+            to_user_id="u@im.wechat",
+            context_token="ctx",
+            item_list=[
+                OutboundItem(type=ITEM_TYPE_TEXT, text_item=TextItemPayload(text="hi"))
+            ],
+        )
+
+    ids = {_make().client_id for _ in range(5)}
+    assert len(ids) == 5, "client_id must be unique per OutboundMessage"
+    # Dumped payload must carry the id on the wire.
+    dumped = dump_outbound(_make())
+    assert dumped["client_id"].startswith("planagent-")
+    assert dumped["from_user_id"] == ""

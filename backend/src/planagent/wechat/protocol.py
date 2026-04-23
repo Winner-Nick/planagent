@@ -192,17 +192,34 @@ class OutboundItem(BaseModel):
     text_item: TextItemPayload | None = None
 
 
+def new_client_id() -> str:
+    """Generate a unique client_id for an outbound message.
+
+    ClawBot's /sendmessage silently de-duplicates consecutive sends that
+    share a client_id (or omit it entirely — the server treats a missing
+    id as a constant default). Without a unique id per send, only the
+    first message in a series reaches the user's WeChat; everything
+    after returns HTTP 200 {} and is dropped without an error.
+    Reference: nightsailer/wechat-clawbot messaging/send.py
+    (_generate_client_id → "openclaw-weixin-<random>").
+    """
+    return f"planagent-{secrets.token_hex(12)}"
+
+
 class OutboundMessage(BaseModel):
     """Body of POST /ilink/bot/sendmessage under the `msg` key.
 
     `group_id` is included only when replying into a group. `context_token`
     must echo the inbound message's token exactly, otherwise the reply
-    doesn't thread in the client UI.
+    doesn't thread in the client UI. `client_id` MUST be unique per send
+    (see `new_client_id` above).
     """
 
     model_config = ConfigDict(extra="allow")
 
     to_user_id: str
+    from_user_id: str = ""
+    client_id: str = Field(default_factory=new_client_id)
     message_type: int = MESSAGE_TYPE_BOT
     message_state: int = MESSAGE_STATE_FINISH
     context_token: str
