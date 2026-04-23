@@ -66,17 +66,22 @@ CHANNEL_VERSION = "1.0.2"
 def build_headers(bot_token: str) -> dict[str, str]:
     """Construct the auth headers every bot endpoint expects.
 
-    X-WECHAT-UIN: base64 of 4 random bytes. Regenerated on each call so that
-    sequential requests don't share a UIN (server uses it for routing /
-    rate-limiting heuristics).
+    X-WECHAT-UIN: base64 of 4 random bytes. Regenerated on each call.
+
+    Pre-login endpoints (/get_bot_qrcode, /get_qrcode_status) have no
+    bot token yet — passing an empty string would produce "Bearer "
+    which httpx rejects as an illegal header value, so we omit
+    Authorization entirely in that case.
     """
     uin = base64.b64encode(secrets.token_bytes(4)).decode("ascii")
-    return {
+    headers: dict[str, str] = {
         "Content-Type": "application/json",
         "AuthorizationType": "ilink_bot_token",
-        "Authorization": f"Bearer {bot_token}",
         "X-WECHAT-UIN": uin,
     }
+    if bot_token:
+        headers["Authorization"] = f"Bearer {bot_token}"
+    return headers
 
 
 # --- Item payloads (discriminated by `type`) ---------------------------------
