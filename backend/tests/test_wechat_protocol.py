@@ -129,6 +129,26 @@ def test_is_at_bot_by_leading_mention() -> None:
     assert is_at_bot(plain, bot_user_id="planagent") is False
 
 
+def test_is_at_bot_false_when_mention_does_not_match_bot_id() -> None:
+    """`@someone_else ...` in a group must NOT count as an at-bot mention
+    once the bot's own user_id is known — otherwise we'd reply to other
+    users' traffic.
+    """
+    other_mention = InboundMessage.model_validate(
+        {
+            "from_user_id": "user1@im.wechat",
+            "group_id": "g1@im.chatroom",
+            "message_type": 1,
+            "item_list": [
+                {"type": 1, "text_item": {"text": "@alice have you seen the PR?"}}
+            ],
+        }
+    )
+    assert is_at_bot(other_mention, bot_user_id="planagent") is False
+    # Without a known bot_user_id we fall back to the permissive heuristic.
+    assert is_at_bot(other_mention, bot_user_id=None) is True
+
+
 def test_group_id_falls_back_to_candidate_field_names() -> None:
     """If the server ever renames to `chatroom_id`, our probe still finds it."""
     msg = InboundMessage.model_validate(

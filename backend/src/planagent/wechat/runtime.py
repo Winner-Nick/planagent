@@ -6,6 +6,8 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 
+import httpx
+
 from .client import ClawBotClient, ClawBotError
 from .protocol import InboundMessage
 
@@ -20,6 +22,7 @@ async def run_polling_loop(
     *,
     client: ClawBotClient | None = None,
     stop_event: asyncio.Event | None = None,
+    backoff_s: float = 2.0,
 ) -> None:
     """Loop forever (or until `stop_event`) dispatching messages to `on_message`.
 
@@ -34,9 +37,9 @@ async def run_polling_loop(
         while not (stop_event and stop_event.is_set()):
             try:
                 resp = await c.long_poll(bot_token, cursor=cursor)
-            except (TimeoutError, ClawBotError, OSError) as exc:
+            except (httpx.HTTPError, TimeoutError, ClawBotError, OSError) as exc:
                 log.warning("long_poll failed: %s", exc)
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(backoff_s)
                 continue
 
             cursor = resp.get_updates_buf or cursor

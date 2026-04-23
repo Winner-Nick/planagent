@@ -302,8 +302,9 @@ def is_at_bot(msg: InboundMessage, bot_user_id: str | None) -> bool:
     if bot_user_id:
         # Accept either the explicit id or the token immediately after '@'.
         head = stripped[1:].split(None, 1)[0] if len(stripped) > 1 else ""
-        if bot_user_id in stripped or head == bot_user_id:
-            return True
+        # When bot_user_id is known, a mismatched mention is NOT for us —
+        # otherwise `@someone_else ...` would trigger unsolicited replies.
+        return bot_user_id in stripped or head == bot_user_id
     # No bot_user_id given — treat any leading @mention as an at-bot signal.
     return True
 
