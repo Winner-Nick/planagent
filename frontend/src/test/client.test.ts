@@ -31,4 +31,21 @@ describe("api client fixture round-trip", () => {
     const reminders = await api.reminders.list(plans[0].id);
     expect(Array.isArray(reminders)).toBe(true);
   });
+
+  it("delete resolves without throwing when server returns 204", async () => {
+    // Route through the live-API path (disable fixtures) with a stubbed fetch
+    // that mimics FastAPI's 204 No Content. httpJson must not call res.json()
+    // on an empty body — doing so would throw despite a valid server response.
+    const origEnv = import.meta.env.VITE_USE_FIXTURES;
+    const origFetch = globalThis.fetch;
+    try {
+      (import.meta.env as Record<string, unknown>).VITE_USE_FIXTURES = "0";
+      globalThis.fetch = (async () =>
+        new Response(null, { status: 204 })) as typeof fetch;
+      await expect(api.plans.delete("plan_demo")).resolves.toBeUndefined();
+    } finally {
+      globalThis.fetch = origFetch;
+      (import.meta.env as Record<string, unknown>).VITE_USE_FIXTURES = origEnv;
+    }
+  });
 });

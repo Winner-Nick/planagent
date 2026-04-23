@@ -37,6 +37,10 @@ export function PlanDetail() {
   useEffect(() => {
     if (!id) return;
     let active = true;
+    setError(null);
+    setPlan(null);
+    setDraft(null);
+    setReminders(null);
     Promise.all([api.plans.get(id), api.reminders.list(id)])
       .then(([p, r]) => {
         if (!active) return;

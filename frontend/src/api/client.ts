@@ -17,7 +17,9 @@ import type {
 const FIXTURE_DELAY_MS = 50;
 
 function useFixtures(): boolean {
-  return import.meta.env.VITE_USE_FIXTURES === "1";
+  // Default ON so `npm run dev` is self-contained; set VITE_USE_FIXTURES=0
+  // to point the UI at a live backend.
+  return import.meta.env.VITE_USE_FIXTURES !== "0";
 }
 
 function apiBase(): string {
@@ -39,7 +41,13 @@ async function httpJson<T>(path: string, init?: RequestInit): Promise<T> {
   if (!res.ok) {
     throw new Error(`Request failed: ${res.status} ${res.statusText}`);
   }
-  return (await res.json()) as T;
+  // 204 / empty-body responses (e.g. DELETE) must not hit res.json().
+  if (res.status === 204 || res.headers.get("content-length") === "0") {
+    return undefined as T;
+  }
+  const text = await res.text();
+  if (!text) return undefined as T;
+  return JSON.parse(text) as T;
 }
 
 function clonePlans(): Plan[] {
