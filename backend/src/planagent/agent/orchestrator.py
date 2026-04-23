@@ -52,6 +52,7 @@ from planagent.agent.prompts import (
     ACTION_TEMP,
     DIALOGUE_TEMP,
     GroupSnapshot,
+    Whiteboard,
     make_prompt,
 )
 from planagent.agent.tools import (
@@ -61,10 +62,15 @@ from planagent.agent.tools import (
     tool_schemas,
 )
 from planagent.db.models import (
+    BotSession,
     ConversationRole,
     ConversationTurn,
+    CrossUserNote,
+    CrossUserNoteKind,
     GroupContext,
     GroupMember,
+    PendingOutbound,
+    PendingOutboundStatus,
     Plan,
     PlanStatus,
     Reminder,
@@ -416,6 +422,200 @@ class _DeferredSender:
         await self(text)
 
 
+async def _build_whiteboard(
+    session_factory: async_sessionmaker,
+    *,
+    group_id: str,
+    speaker_wechat_user_id: str | None,
+    snapshot: GroupSnapshot,
+) -> tuple[Whiteboard, list[str]]:
+    """Assemble the whiteboard for this speaker.
+
+    Returns (whiteboard, consumable_note_ids). The caller is expected to
+    stamp `consumed_at` on those ids after the prompt has been built, so
+    a single inbound marks them as seen exactly once. Kept separate from
+    rendering to preserve the "render → persist" ordering even if one step
+    errors.
+    """
+    # Identify the peer by walking the members list. The snapshot already
+    # carries display names (PR-G hook), so reuse rather than re-querying.
+    peer_display: str | None = None
+    peer_uid: str | None = None
+    for m in snapshot.members:
+        uid = m.get("wechat_user_id")
+        if uid and uid != speaker_wechat_user_id:
+            peer_uid = uid
+            peer_display = m.get("display_name")
+            break
+
+    peer_last_inbound_at: datetime | None = None
+    peer_open_plans = 0
+    peer_overdue = 0
+    plans_by_owner: dict[str, list[dict[str, Any]]] = {}
+    unconsumed_notes: list[dict[str, Any]] = []
+    consumable_ids: list[str] = []
+
+    now_utc = datetime.now(UTC)
+    async with session_factory() as session:
+        if peer_uid:
+            bs_res = await session.execute(
+                select(BotSession).where(BotSession.wechat_user_id == peer_uid)
+            )
+            bs = bs_res.scalar_one_or_none()
+            if bs is not None and bs.last_inbound_at is not None:
+                la = bs.last_inbound_at
+                if la.tzinfo is None:
+                    la = la.replace(tzinfo=UTC)
+                peer_last_inbound_at = la.astimezone(SHANGHAI)
+
+            open_statuses = [
+                PlanStatus.draft,
+                PlanStatus.active,
+                PlanStatus.paused,
+            ]
+            pres = await session.execute(
+                select(Plan).where(
+                    Plan.group_id == group_id,
+                    Plan.owner_user_id == peer_uid,
+                    Plan.status.in_(open_statuses),
+                )
+            )
+            open_plans = list(pres.scalars().all())
+            peer_open_plans = len(open_plans)
+            for p in open_plans:
+                if p.due_at is None:
+                    continue
+                due = p.due_at if p.due_at.tzinfo is not None else p.due_at.replace(tzinfo=UTC)
+                if due < now_utc:
+                    peer_overdue += 1
+
+        # Plans-by-owner summary for the rendered board. Keyed by display
+        # name so the prompt reads naturally; lists are small (we filter
+        # to open statuses at load time).
+        for p in snapshot.plans:
+            owner_uid = p.get("owner_user_id")
+            if not owner_uid:
+                continue
+            # Resolve owner_uid → display name via the member roster.
+            label: str | None = None
+            if owner_uid == speaker_wechat_user_id:
+                label = snapshot.speaker_display_name
+            else:
+                for m in snapshot.members:
+                    if m.get("wechat_user_id") == owner_uid:
+                        label = m.get("display_name")
+                        break
+            if not label:
+                continue
+            plans_by_owner.setdefault(label, []).append(
+                {
+                    "title": p.get("title"),
+                    "status": p.get("status"),
+                    "next_fire_at": p.get("next_fire_at"),
+                }
+            )
+
+        if speaker_wechat_user_id:
+            nres = await session.execute(
+                select(CrossUserNote)
+                .where(
+                    CrossUserNote.group_id == group_id,
+                    CrossUserNote.audience_user_id == speaker_wechat_user_id,
+                    CrossUserNote.consumed_at.is_(None),
+                )
+                .order_by(CrossUserNote.created_at.asc())
+            )
+            for n in nres.scalars().all():
+                created_local = ""
+                if n.created_at is not None:
+                    ca = n.created_at
+                    if ca.tzinfo is None:
+                        ca = ca.replace(tzinfo=UTC)
+                    created_local = ca.astimezone(SHANGHAI).strftime("%H:%M")
+                kind_val = n.kind.value if isinstance(n.kind, CrossUserNoteKind) else n.kind
+                unconsumed_notes.append(
+                    {
+                        "kind": kind_val,
+                        "text": n.text,
+                        "created_at_local": created_local,
+                    }
+                )
+                consumable_ids.append(n.id)
+
+    wb = Whiteboard(
+        peer_display_name=peer_display,
+        peer_last_inbound_at=peer_last_inbound_at,
+        peer_open_plans=peer_open_plans,
+        peer_overdue_count=peer_overdue,
+        unconsumed_notes=unconsumed_notes,
+        plans_by_owner=plans_by_owner,
+    )
+    return wb, consumable_ids
+
+
+async def _flush_pending_outbound(
+    session_factory: async_sessionmaker,
+    *,
+    group_id: str,
+    target_user_id: str,
+    wechat_send: WechatSend,
+) -> int:
+    """Send any queued cross-user messages addressed to this speaker.
+
+    Each pending row is delivered as its own outbound — the underlying
+    WeChat client stamps a unique client_id per send (PR #9 fix), so the
+    ClawBot dedup won't collapse consecutive deliveries. Rows are flipped
+    to `delivered` only after the send returns; if the send throws, the
+    row stays `pending` and we'll retry on a later inbound.
+    """
+    # Snapshot the rows first so we release the session before awaiting
+    # the (slow) transport. Keeping the session open across an I/O await
+    # would serialize every subsequent DB write in the handler.
+    async with session_factory() as session:
+        res = await session.execute(
+            select(PendingOutbound)
+            .where(
+                PendingOutbound.group_id == group_id,
+                PendingOutbound.target_user_id == target_user_id,
+                PendingOutbound.status == PendingOutboundStatus.pending,
+            )
+            .order_by(PendingOutbound.created_at.asc())
+        )
+        rows = list(res.scalars().all())
+        pending = [(r.id, r.text) for r in rows]
+
+    delivered = 0
+    for row_id, text in pending:
+        try:
+            await wechat_send(text)
+        except Exception:
+            log.exception("pending_outbound %s delivery failed", row_id)
+            continue
+        async with session_factory() as session:
+            row = await session.get(PendingOutbound, row_id)
+            if row is None:
+                continue
+            row.status = PendingOutboundStatus.delivered
+            row.delivered_at = datetime.now(UTC)
+            await session.commit()
+        delivered += 1
+    return delivered
+
+
+async def _mark_notes_consumed(
+    session_factory: async_sessionmaker, *, note_ids: list[str]
+) -> None:
+    if not note_ids:
+        return
+    async with session_factory() as session:
+        for nid in note_ids:
+            row = await session.get(CrossUserNote, nid)
+            if row is None or row.consumed_at is not None:
+                continue
+            row.consumed_at = datetime.now(UTC)
+        await session.commit()
+
+
 async def handle_inbound(
     msg: InboundMessage,
     *,
@@ -451,13 +651,36 @@ async def handle_inbound(
         context_token=msg.context_token,
     )
 
+    # PR-H: before running the agent loop, flush any cross-user messages
+    # queued for this speaker. These go out on the live `wechat_send` (not
+    # through the DeferredSender) so each has its own client_id and arrives
+    # before the agent's own reply to the current inbound.
+    if speaker_user_id:
+        await _flush_pending_outbound(
+            session_factory,
+            group_id=group_internal_id,
+            target_user_id=speaker_user_id,
+            wechat_send=wechat_send,
+        )
+
     snapshot = await _load_snapshot(
         session_factory,
         group_id=group_internal_id,
         speaker_wechat_user_id=speaker_user_id,
     )
+    # PR-H: assemble whiteboard with unconsumed peer→speaker notes + peer
+    # activity snapshot. Notes are marked consumed AFTER make_prompt so a
+    # crash mid-prompt doesn't silently lose them.
+    whiteboard, consumable_note_ids = await _build_whiteboard(
+        session_factory,
+        group_id=group_internal_id,
+        speaker_wechat_user_id=speaker_user_id,
+        snapshot=snapshot,
+    )
+    snapshot.whiteboard = whiteboard
     now = datetime.now(SHANGHAI)
     system_prompt = make_prompt(snapshot, now=now)
+    await _mark_notes_consumed(session_factory, note_ids=consumable_note_ids)
 
     history = await _load_history_for_speaker(
         session_factory,
