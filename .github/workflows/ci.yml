@@ -60,7 +60,13 @@ jobs:
           node-version: "22"
       - name: Install
         working-directory: frontend
-        run: npm ci
+        run: npm ci --foreground-scripts --loglevel=verbose
+      - name: Dump npm debug log on failure
+        if: failure()
+        run: |
+          echo "=== npm debug log ==="
+          ls -la /home/runner/.npm/_logs/ || true
+          cat /home/runner/.npm/_logs/*.log | tail -200 || true
       - name: Typecheck
         working-directory: frontend
         run: npm run typecheck
