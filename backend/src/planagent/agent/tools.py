@@ -21,7 +21,21 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from planagent.api.schemas import PlanUpdate
-from planagent.db.models import Plan, PlanStatus, Reminder, ReminderStatus
+from planagent.db.models import (
+    CrossUserNote,
+    CrossUserNoteKind,
+    PendingOutbound,
+    PendingOutboundStatus,
+    Plan,
+    PlanStatus,
+    Reminder,
+    ReminderStatus,
+)
+from planagent.wechat.constants import (
+    CHENCHEN,
+    PENG,
+    display_name_for,
+)
 
 # wechat_send(text: str) -> awaitable. Returns None; side-effect only.
 WechatSend = Callable[[str], Awaitable[None]]
@@ -273,6 +287,195 @@ async def _ask_user_in_group(ctx: ToolContext, *, question: str) -> dict[str, An
     return {"sent": True}
 
 
+# --- Cross-user whiteboard helpers (PR-H) ------------------------------------
+
+# Short peer keys the LLM uses in natural conversation. Mapped to the known
+# roster at call time. Keeping this local to tools.py keeps `constants` free
+# of tool-facing aliases.
+_PEER_BY_KEY: dict[str, str] = {
+    PENG.cred_name: PENG.wechat_user_id,
+    CHENCHEN.cred_name: CHENCHEN.wechat_user_id,
+}
+
+_CROSS_NOTE_TEXT_MAX = 200
+
+
+def _resolve_peer_key(peer: str) -> str | None:
+    """Map a peer alias ("peng"/"chenchen") to a wechat_user_id. Case-insensitive."""
+    if not peer:
+        return None
+    return _PEER_BY_KEY.get(peer.strip().lower())
+
+
+async def _note_for_peer(
+    ctx: ToolContext,
+    *,
+    audience: str,
+    kind: str = "info",
+    text: str,
+) -> dict[str, Any]:
+    """Stash a note addressed to the other human in this logical group.
+
+    The note is stored, NOT sent. The audience sees it on their next inbound
+    turn as part of the volatile whiteboard section of the prompt.
+    """
+    audience_uid = _resolve_peer_key(audience)
+    if not audience_uid:
+        return {"error": "unknown_audience", "detail": audience}
+    if not ctx.sender_user_id:
+        return {"error": "no_sender_context"}
+    if audience_uid == ctx.sender_user_id:
+        return {"error": "audience_is_speaker"}
+    try:
+        kind_enum = CrossUserNoteKind(kind)
+    except ValueError:
+        return {
+            "error": "invalid_kind",
+            "detail": kind,
+            "allowed": [k.value for k in CrossUserNoteKind],
+        }
+    stripped = (text or "").strip()
+    if not stripped:
+        return {"error": "empty_text"}
+    if len(stripped) > _CROSS_NOTE_TEXT_MAX:
+        return {
+            "error": "text_too_long",
+            "limit": _CROSS_NOTE_TEXT_MAX,
+            "length": len(stripped),
+        }
+    async with ctx.session_factory() as session:
+        note = CrossUserNote(
+            group_id=ctx.group_id,
+            author_user_id=ctx.sender_user_id,
+            audience_user_id=audience_uid,
+            kind=kind_enum,
+            text=stripped,
+        )
+        session.add(note)
+        await session.commit()
+        await session.refresh(note)
+        return {"ok": True, "note_id": note.id}
+
+
+async def _peek_peer_state(ctx: ToolContext, *, peer: str) -> dict[str, Any]:
+    """Introspect the other human's recent activity without polluting history.
+
+    Returned fields are a momentary snapshot — never persisted into the
+    conversation log. The LLM uses this to decide whether to nudge, wait,
+    or ask the speaker something before touching peer-facing plans.
+    """
+    peer_uid = _resolve_peer_key(peer)
+    if not peer_uid:
+        return {"error": "unknown_peer", "detail": peer}
+    if not ctx.sender_user_id:
+        return {"error": "no_sender_context"}
+    # Local import to avoid a cycle: BotSession lives in db.models but we
+    # reference it only here.
+    from planagent.db.models import BotSession
+
+    now_utc = datetime.now(UTC)
+    async with ctx.session_factory() as session:
+        bs_res = await session.execute(
+            select(BotSession).where(BotSession.wechat_user_id == peer_uid)
+        )
+        bs = bs_res.scalar_one_or_none()
+        last_inbound_at_iso: str | None = None
+        if bs is not None and bs.last_inbound_at is not None:
+            last_inbound_at_iso = bs.last_inbound_at.isoformat()
+
+        open_statuses = [PlanStatus.draft, PlanStatus.active, PlanStatus.paused]
+        open_plans_count = (
+            await session.execute(
+                select(Plan).where(
+                    Plan.group_id == ctx.group_id,
+                    Plan.owner_user_id == peer_uid,
+                    Plan.status.in_(open_statuses),
+                )
+            )
+        ).scalars().all()
+
+        # Overdue: plan has a due_at in the past AND status is not completed.
+        overdue_rows = [
+            p
+            for p in open_plans_count
+            if p.due_at is not None
+            and (
+                p.due_at
+                if p.due_at.tzinfo is not None
+                else p.due_at.replace(tzinfo=UTC)
+            )
+            < now_utc
+        ]
+
+        # Notes the speaker has sent the peer recently (last 10).
+        notes_res = await session.execute(
+            select(CrossUserNote)
+            .where(
+                CrossUserNote.group_id == ctx.group_id,
+                CrossUserNote.author_user_id == ctx.sender_user_id,
+                CrossUserNote.audience_user_id == peer_uid,
+            )
+            .order_by(CrossUserNote.created_at.desc())
+            .limit(10)
+        )
+        recent_notes = [
+            {
+                "kind": n.kind.value if isinstance(n.kind, CrossUserNoteKind) else n.kind,
+                "text": n.text,
+                "consumed": n.consumed_at is not None,
+                "created_at": n.created_at.isoformat() if n.created_at else None,
+            }
+            for n in notes_res.scalars().all()
+        ]
+
+    return {
+        "wechat_user_id": peer_uid,
+        "display_name": display_name_for(peer_uid),
+        "last_inbound_at_iso": last_inbound_at_iso,
+        "open_plans_count": len(open_plans_count),
+        "overdue_count": len(overdue_rows),
+        "recent_notes_I_sent_them": recent_notes,
+    }
+
+
+async def _send_to_peer_async(
+    ctx: ToolContext, *, peer: str, text: str
+) -> dict[str, Any]:
+    """Queue a message for the other human; delivered on their next inbound.
+
+    We never try to push it right away: ClawBot is gated by a 24h inbound
+    window and we cannot know whether the peer's window is open. The
+    orchestrator flushes `pending_outbound` rows at the start of every
+    inbound handler invocation.
+    """
+    peer_uid = _resolve_peer_key(peer)
+    if not peer_uid:
+        return {"error": "unknown_peer", "detail": peer}
+    if not ctx.sender_user_id:
+        return {"error": "no_sender_context"}
+    if peer_uid == ctx.sender_user_id:
+        return {"error": "peer_is_speaker"}
+    stripped = (text or "").strip()
+    if not stripped:
+        return {"error": "empty_text"}
+    async with ctx.session_factory() as session:
+        row = PendingOutbound(
+            group_id=ctx.group_id,
+            target_user_id=peer_uid,
+            author_user_id=ctx.sender_user_id,
+            text=stripped,
+            status=PendingOutboundStatus.pending,
+        )
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+        return {
+            "queued": True,
+            "pending_id": row.id,
+            "note": "will be delivered on peer's next inbound.",
+        }
+
+
 async def _record_note(ctx: ToolContext, *, plan_id: str, note: str) -> dict[str, Any]:
     async with ctx.session_factory() as session:
         plan = await _fetch_plan_in_group(session, ctx, plan_id)
@@ -473,6 +676,87 @@ TOOL_REGISTRY: dict[str, Tool] = {
             "required": ["plan_id", "note"],
         },
         handler=_record_note,
+    ),
+    "note_for_peer": Tool(
+        name="note_for_peer",
+        description=(
+            "把一条备忘贴到共享白板上，留给群里另一个人下次上线时看。"
+            "**不会立刻发给对方**，只会进对方下一次的 prompt 上下文。"
+            "适用场景：当前说话人顺口提到对方最近的情况（info）、"
+            "希望对方下次被轻轻推一下（nudge_request）、"
+            "或者想留一句夸赞 / 感谢（appreciate）。"
+            "text 限制 200 字以内；audience 是对方的短名（peng / chenchen）。"
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "audience": {
+                    "type": "string",
+                    "enum": ["peng", "chenchen"],
+                    "description": "留给谁看。必须是对方，不是自己。",
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["info", "nudge_request", "appreciate"],
+                    "default": "info",
+                    "description": (
+                        "备忘类型：info=情报；nudge_request=请提醒对方；appreciate=夸赞。"
+                    ),
+                },
+                "text": {
+                    "type": "string",
+                    "description": "备忘正文，≤200 字。用对方能读懂的话写。",
+                },
+            },
+            "required": ["audience", "text"],
+        },
+        handler=_note_for_peer,
+    ),
+    "peek_peer_state": Tool(
+        name="peek_peer_state",
+        description=(
+            "快速看一眼对方（peer）的当前状态：最后一次活跃时间、活跃计划数、"
+            "逾期计划数、以及当前说话人最近给对方留过的备忘。"
+            "用来决定是不是该催一下、是不是别打扰。"
+            "结果只在这一轮内可见，不会写进对话历史。"
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "peer": {
+                    "type": "string",
+                    "enum": ["peng", "chenchen"],
+                    "description": "想查的是哪一个人。",
+                },
+            },
+            "required": ["peer"],
+        },
+        handler=_peek_peer_state,
+    ),
+    "send_to_peer_async": Tool(
+        name="send_to_peer_async",
+        description=(
+            "给对方发一条消息，但不是实时送达——它进入 pending 队列，"
+            "等对方下次开口时由后台自动送出（ClawBot 有 24 小时窗口限制）。"
+            "适合：替当前说话人转话、跨用户提醒、当前说话人想对对方说一句但对方"
+            "还没活跃。返回 pending_id，状态由 orchestrator 在对方 inbound 时翻转。"
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "peer": {
+                    "type": "string",
+                    "enum": ["peng", "chenchen"],
+                    "description": "发给谁（对方的短名）。",
+                },
+                "text": {
+                    "type": "string",
+                    "description": "要发给对方的完整文本，用你平时说话的口气。",
+                },
+            },
+            "required": ["peer", "text"],
+        },
+        handler=_send_to_peer_async,
     ),
 }
 

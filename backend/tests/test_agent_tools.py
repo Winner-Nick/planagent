@@ -211,6 +211,10 @@ async def test_tool_schemas_shape() -> None:
         "reply_in_group",
         "ask_user_in_group",
         "record_note",
+        # PR-H: cross-user whiteboard tools.
+        "note_for_peer",
+        "peek_peer_state",
+        "send_to_peer_async",
     }
     assert names == expected
     for s in schemas:

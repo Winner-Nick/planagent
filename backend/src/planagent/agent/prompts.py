@@ -24,7 +24,7 @@ PR-G changes vs. PR-D:
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -98,6 +98,22 @@ _PERSONA = """\
   ✓ "收到～ 15:38 戳你喝水 💧"
 - 消息写得像你在微信跟朋友聊天：逗号 / 波浪号代替句号，短句比长句好，该停就停。
 
+# 跨用户白板（### 白板 ### 区块）
+- volatile 上下文里会带一段"白板"，汇总对方（peer）的活跃度 / 活跃计划 / 逾期数，
+  以及对方留给你（当前说话人）的 unconsumed 备忘。看过就算"读取"了，orchestrator
+  会在这次 inbound 自动把它们标成 consumed。
+- 三个跨用户工具（只在有真实意图时才用，别滥用）：
+  - `note_for_peer(audience, kind, text)`：给对方留一条白板备忘，TA 下次上线看得到。
+    适用场景：当前说话人顺嘴提到对方（"辰辰最近在忙项目"），或请你提醒对方。
+    **不会立刻发消息**，只进白板。
+  - `peek_peer_state(peer)`：查一眼对方的活跃度 / 计划数 / 逾期数，帮你判断要不要催。
+    只在这一轮可见，不写历史。
+  - `send_to_peer_async(peer, text)`：当前说话人让你"告诉对方 xxx"时用——进 pending
+    队列，对方下次开口时由后台把这条消息先发给 TA，再跑对方自己的回复。
+- 一条基本原则：**当前说话人只看到自己的回复**。你想让对方知道的事，要么走
+  `note_for_peer`（软提示），要么走 `send_to_peer_async`（明确带话）。别指望写在给
+  当前说话人的回复里对方能看到。
+
 # 工具使用原则
 - 能用工具就用工具，不要用自然语言"伪执行"。
 - 一个新计划只要标题明确就立刻 `create_plan_draft`，后续字段用 `update_plan` 补齐。
@@ -158,6 +174,120 @@ STABLE_PREFIX = (
 
 
 @dataclass
+class Whiteboard:
+    """Volatile cross-user context rendered under `WHITEBOARD_MARKER`.
+
+    Budget: the rendered block MUST stay ≤ 400 chars — it rides the volatile
+    tail of every turn's prompt. `render` trims unconsumed notes first,
+    then the plan board, to keep under budget when data grows.
+
+    Notes semantics:
+    - Only notes where `audience_user_id == speaker` should be populated;
+      notes the speaker wrote *to* the peer live in peer's next prompt,
+      not this one.
+    """
+
+    peer_display_name: str | None = None
+    peer_last_inbound_at: datetime | None = None  # rendered Asia/Shanghai
+    peer_open_plans: int = 0
+    peer_overdue_count: int = 0
+    # [{kind, text, created_at_local}] — notes from peer → speaker, unconsumed.
+    unconsumed_notes: list[dict[str, Any]] = field(default_factory=list)
+    # {"鹏鹏": [{title, status, next_fire_at?, due_at?}], "辰辰": [...]}
+    plans_by_owner: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+
+    def render(self, *, budget_chars: int = 400) -> str:
+        header = WHITEBOARD_MARKER
+        # Peer line.
+        if self.peer_display_name is None:
+            peer_line = "对方: 暂无活动"
+        else:
+            bits: list[str] = []
+            if self.peer_last_inbound_at is not None:
+                bits.append(
+                    f"最近活跃 {self.peer_last_inbound_at.strftime('%m-%d %H:%M')}"
+                )
+            else:
+                bits.append("最近没活跃")
+            bits.append(f"活跃计划 {self.peer_open_plans}")
+            if self.peer_overdue_count:
+                bits.append(f"逾期 {self.peer_overdue_count}")
+            peer_line = f"对方（{self.peer_display_name}）: " + " · ".join(bits)
+            if (
+                self.peer_open_plans == 0
+                and self.peer_overdue_count == 0
+                and self.peer_last_inbound_at is None
+            ):
+                peer_line = f"对方（{self.peer_display_name}）: 暂无活动"
+
+        def _note_line(n: dict[str, Any]) -> str:
+            kind = n.get("kind") or "info"
+            text = n.get("text") or ""
+            ts = n.get("created_at_local") or ""
+            # Truncate overly long note text so one row can't blow budget.
+            if len(text) > 40:
+                text = text[:38] + "…"
+            tag = f"[{kind}]"
+            return f"- {tag} {text}  ({ts})" if ts else f"- {tag} {text}"
+
+        def _plan_line(p: dict[str, Any]) -> str:
+            title = p.get("title") or "?"
+            status = p.get("status") or ""
+            tail_bits: list[str] = []
+            if p.get("next_fire_at"):
+                tail_bits.append(f"下一次 {p['next_fire_at']}")
+            if p.get("due_at"):
+                tail_bits.append(f"ddl {p['due_at']}")
+            tail = " · ".join(tail_bits)
+            if tail:
+                return f"  • {title} ({status}, {tail})"
+            return f"  • {title} ({status})"
+
+        # Build chunks in reverse priority: peer line is non-negotiable; notes
+        # come next; plans board is the largest and gets trimmed first.
+        notes = list(self.unconsumed_notes)
+        plans_by_owner = {k: list(v) for k, v in self.plans_by_owner.items()}
+
+        def _assemble(
+            notes_in: list[dict[str, Any]],
+            owners_in: dict[str, list[dict[str, Any]]],
+        ) -> str:
+            chunks: list[str] = [header, peer_line]
+            if notes_in:
+                chunks.append("给你的备忘:")
+                chunks.extend(_note_line(n) for n in notes_in)
+            if owners_in and any(owners_in.values()):
+                chunks.append("计划看板 (按 owner 分组):")
+                for owner, plist in owners_in.items():
+                    if not plist:
+                        continue
+                    chunks.append(f"- {owner}:")
+                    chunks.extend(_plan_line(p) for p in plist)
+            return "\n".join(chunks)
+
+        rendered = _assemble(notes, plans_by_owner)
+        # Trim loop: plans first (biggest), then notes.
+        while len(rendered) > budget_chars:
+            trimmed = False
+            # Drop last plan from the largest owner list.
+            if plans_by_owner:
+                biggest_owner = max(plans_by_owner, key=lambda k: len(plans_by_owner[k]))
+                if plans_by_owner[biggest_owner]:
+                    plans_by_owner[biggest_owner].pop()
+                    trimmed = True
+            if not trimmed and notes:
+                notes.pop()
+                trimmed = True
+            if not trimmed:
+                break
+            rendered = _assemble(notes, plans_by_owner)
+        # Final hard cap (if even empty skeleton somehow over budget).
+        if len(rendered) > budget_chars:
+            rendered = rendered[: budget_chars - 1] + "…"
+        return rendered
+
+
+@dataclass
 class GroupSnapshot:
     group_id: str
     wechat_group_id: str
@@ -166,6 +296,7 @@ class GroupSnapshot:
     plans: list[dict[str, Any]]  # {id, title, status, next_fire_at, owner_user_id}
     speaker_wechat_user_id: str | None = None
     speaker_display_name: str | None = None
+    whiteboard: Whiteboard | None = None
 
 
 def _plan_line(p: dict[str, Any]) -> str:
@@ -223,9 +354,12 @@ def _render_volatile(snapshot: GroupSnapshot, now: datetime) -> str:
         speaker_block,
     ]
     chunks.extend(peer_blocks)
-    # PR-H inserts cross-user whiteboard notes under WHITEBOARD_MARKER.
-    # PR-G leaves the marker as a placeholder so the LLM already knows the slot.
-    chunks.append(f"{WHITEBOARD_MARKER}\n（暂无跨用户留言）")
+    # PR-H: whiteboard. If the orchestrator passed one in, render it; else
+    # keep the placeholder so the marker is still present.
+    if snapshot.whiteboard is not None:
+        chunks.append(snapshot.whiteboard.render())
+    else:
+        chunks.append(f"{WHITEBOARD_MARKER}\n（暂无跨用户留言）")
     return "\n".join(chunks) + "\n"
 
 
@@ -246,6 +380,7 @@ __all__ = [
     "STABLE_PREFIX",
     "VOLATILE_MARKER",
     "WHITEBOARD_MARKER",
+    "Whiteboard",
     "make_prompt",
     "stable_prefix_bytes",
 ]

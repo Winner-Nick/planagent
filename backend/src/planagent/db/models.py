@@ -48,6 +48,21 @@ class PendingOutboundStatus(str, enum.Enum):  # noqa: UP042
     cancelled = "cancelled"
 
 
+class CrossUserNoteKind(str, enum.Enum):  # noqa: UP042
+    """Taxonomy for the cross-user whiteboard (PR-H).
+
+    - info: passive tidbit (e.g. Peng mentions 辰辰最近压力大; 小计 stashes it
+      so her next turn's prompt reflects that context).
+    - nudge_request: the author explicitly wants the audience prodded about
+      something (e.g. "记得催鹏鹏学 Rust"). Rendered louder on the whiteboard.
+    - appreciate: a warm note meant to surface as positive reinforcement.
+    """
+
+    info = "info"
+    nudge_request = "nudge_request"
+    appreciate = "appreciate"
+
+
 class GroupContext(Base):
     __tablename__ = "group_contexts"
 
@@ -270,4 +285,41 @@ class PendingOutbound(Base):
         Enum(PendingOutboundStatus, name="pending_outbound_status"),
         default=PendingOutboundStatus.pending,
         nullable=False,
+    )
+
+
+class CrossUserNote(Base):
+    """Cross-user whiteboard entry (PR-H).
+
+    One human (`author_user_id`) dictates a note addressed to the other human
+    (`audience_user_id`) via `note_for_peer`. The next time the audience
+    speaks to 小计, the orchestrator surfaces unconsumed notes into the
+    volatile whiteboard section of their prompt and stamps `consumed_at`.
+
+    `text` is capped at 200 chars by policy (enforced at the tool layer, not
+    the DB schema) so the whiteboard section stays under its global 400-char
+    budget — see `prompts.Whiteboard.render`.
+    """
+
+    __tablename__ = "cross_user_notes"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    group_id: Mapped[str] = mapped_column(
+        ForeignKey("group_contexts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    author_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    audience_user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    kind: Mapped[CrossUserNoteKind] = mapped_column(
+        Enum(CrossUserNoteKind, name="cross_user_note_kind"),
+        default=CrossUserNoteKind.info,
+        nullable=False,
+    )
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
     )
