@@ -38,8 +38,15 @@ def wechat_send_for(
     bot_token: str,
     to_user_id: str,
     context_token: str,
+    group_id: str | None = None,
 ) -> WechatSend:
-    """Return a wechat_send closure bound to a specific outbound destination."""
+    """Return a wechat_send closure bound to a specific outbound destination.
+
+    `group_id` defaults to None (personal WeChat ClawBot only has 1:1 chats),
+    but legacy / non-ClawBot transports may thread a real group id through;
+    the `build_handler` shim passes the inbound's group_id so replies stay
+    in the original group thread.
+    """
 
     async def _send(text: str) -> None:
         if not text or not to_user_id:
@@ -49,7 +56,7 @@ def wechat_send_for(
             to_user_id=to_user_id,
             text=text,
             context_token=context_token,
-            group_id=None,  # 1:1 only — ClawBot has no group chat on personal WeChat
+            group_id=group_id,
         )
 
     return _send
@@ -181,11 +188,15 @@ def build_handler(
 
     async def _on_message(msg: InboundMessage) -> None:
         to_user_id = wxp.sender_id(msg) or msg.from_user_id or ""
+        # Preserve the inbound's group_id on the outbound so legacy/group
+        # traffic threads correctly. Personal WeChat ClawBot leaves this
+        # None; enterprise WeChat / QQ adapters fill it.
         send = wechat_send_for(
             client=client,
             bot_token=bot_token,
             to_user_id=to_user_id,
             context_token=msg.context_token or "",
+            group_id=wxp.group_id(msg),
         )
         service = AgentService(
             deepseek=deepseek,

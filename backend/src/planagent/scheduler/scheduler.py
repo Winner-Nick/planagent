@@ -66,6 +66,7 @@ class _PendingSend:
     reminder_id: str
     bot_token: str
     to_user_id: str
+    session_id: str | None  # BotSession.id if the reminder fans to a session
     context_token: str | None
     message: str
 
@@ -182,6 +183,11 @@ class Scheduler:
                 )
             except Exception:  # noqa: BLE001
                 log.exception("wechat_send failed for reminder %s", item.reminder_id)
+            else:
+                # Stamp last_outbound_at BEFORE the wake-up pass so the LLM
+                # doesn't double-nudge right after we already sent a reminder.
+                if item.session_id is not None:
+                    await self._stamp_session_outbound(item.session_id, now)
 
         # Wake-up ping pass.
         if self._enable_wakeup:
@@ -321,21 +327,33 @@ class Scheduler:
                                 reminder_id=r.id,
                                 bot_token=bs.bot_token,
                                 to_user_id=bs.wechat_user_id,
+                                session_id=bs.id,
                                 context_token=bs.last_context_token,
                                 message=r.message,
                             )
                         )
-                else:
-                    # Legacy: no BotSession rows (PR-E-era DB). Use group's
-                    # last_context_token + wechat_group_id as the "user id".
+                elif not self._send_is_per_session:
+                    # Legacy path (PR-E-era DB): only safe when a 3-arg
+                    # wechat_send was wired, which expects (group, msg, ctx).
+                    # Under a 4-arg per-session sender, an empty bot_token
+                    # would silently 401 after the reminder was already
+                    # flipped to `sent`, dropping the notification entirely.
                     claimed.append(
                         _PendingSend(
                             reminder_id=r.id,
-                            bot_token="",  # legacy path ignores it
+                            bot_token="",
                             to_user_id=group.wechat_group_id,
+                            session_id=None,
                             context_token=group.last_context_token,
                             message=r.message,
                         )
+                    )
+                else:
+                    log.warning(
+                        "reminder %s has no BotSession in group %s — skipping "
+                        "send and leaving reminder as sent (no recipient)",
+                        r.id,
+                        group.id,
                     )
             await session.commit()
         return claimed
@@ -390,6 +408,13 @@ class Scheduler:
             bs = await session.get(BotSession, session_id)
             if bs is not None:
                 bs.last_wakeup_ping_at = now
+                bs.last_outbound_at = now
+                await session.commit()
+
+    async def _stamp_session_outbound(self, session_id: str, now: datetime) -> None:
+        async with self._sm() as session:
+            bs = await session.get(BotSession, session_id)
+            if bs is not None:
                 bs.last_outbound_at = now
                 await session.commit()
 
