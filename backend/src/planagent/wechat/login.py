@@ -1,14 +1,19 @@
 """CLI: `python -m planagent.wechat.login` — QR scan login flow.
 
-Renders the QR to the terminal (if possible) and saves a PNG fallback to
-./qrcode.png. Persists the bot_token to ~/.planagent/credentials.json on
-success.
+Renders the QR to the terminal and saves a PNG fallback to ./qrcode.png.
+Persists the bot_token to ~/.planagent/credentials.json on success.
+
+Important: the server's `qrcode` field is the *polling token*, not the
+payload to encode in the QR image. The payload WeChat's scanner expects
+is `qrcode_img_content`, which despite its name is typically a
+`liteapp.weixin.qq.com/q/...` URL that opens the authorization page.
+Encoding the polling token gives users a QR that WeChat reads as plain
+text (they just see a hex string), which is why we use the URL.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import sys
 from pathlib import Path
 
@@ -34,36 +39,52 @@ def _render_qr_terminal(payload: str) -> None:
     qr.print_ascii(invert=True)
 
 
-def _save_qr_png(session: QRCodeSession, path: Path) -> bool:
-    """Try to write a PNG to disk. Returns True on success."""
-    raw = session.qrcode_img_bytes
-    if not raw:
-        return False
+def _save_qr_png(payload: str, path: Path) -> bool:
+    """Write a fresh PNG of the scan URL to disk.
+
+    PNG rendering requires Pillow; if unavailable we skip silently.
+    """
     try:
-        path.write_bytes(raw)
+        img = qrcode.make(payload)
+        img.save(str(path))
         return True
-    except OSError:
+    except Exception:  # noqa: BLE001 — PNG export is a nice-to-have
         return False
+
+
+def _scan_payload(session: QRCodeSession) -> str:
+    """Pick the string to encode in the QR.
+
+    Prefer `qrcode_img_content` (the WeChat scan URL); fall back to the
+    polling token only if the server omits the URL — that fallback won't
+    actually log anyone in, but it still produces a renderable code for
+    diagnostics.
+    """
+    return session.qrcode_img_content or session.qrcode
 
 
 async def run() -> int:
     async with ClawBotClient() as client:
         session = await client.get_login_qrcode()
-        payload = session.qrcode
+        scan_url = _scan_payload(session)
 
-        print("Scan the QR code below in WeChat to log the bot in.\n")
+        print("Scan the QR code below in WeChat to log the bot in.")
+        if scan_url.startswith("http"):
+            print(f"(encoded payload: {scan_url})\n")
+        else:
+            print()
         try:
-            _render_qr_terminal(payload)
+            _render_qr_terminal(scan_url)
         except Exception:  # noqa: BLE001
             print("(Could not render QR to terminal.)")
 
         png_path = Path("./qrcode.png")
-        if _save_qr_png(session, png_path):
-            print(f"\nQR image also written to {png_path} (raw content from server).")
+        if _save_qr_png(scan_url, png_path):
+            print(f"\nQR image also written to {png_path}.")
 
         print("\nWaiting for scan confirmation (up to 180s)…")
         try:
-            logged_in = await client.poll_login(payload)
+            logged_in = await client.poll_login(session.qrcode)
         except Exception as exc:  # noqa: BLE001
             print(f"Login failed: {exc}", file=sys.stderr)
             return 1
@@ -80,8 +101,6 @@ async def run() -> int:
         print(f"  baseurl   : {logged_in.baseurl or '(default)'}")
         if logged_in.bot_user_id:
             print(f"  bot_user_id: {logged_in.bot_user_id}")
-        # Silence pyflakes on unused helper when extending later.
-        _ = base64
         return 0
 
 
