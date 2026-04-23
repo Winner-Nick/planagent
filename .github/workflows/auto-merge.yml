@@ -1,0 +1,20 @@
+name: Auto-merge
+
+on:
+  pull_request_review:
+    types: [submitted]
+  check_suite:
+    types: [completed]
+  status: {}
+
+jobs:
+  automerge:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.pull_request.draft == false || github.event_name != 'pull_request_review' }}
+    steps:
+      - name: Enable auto-merge when CI green + review approved
+        uses: peter-evans/enable-pull-request-automerge@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          pull-request-number: ${{ github.event.pull_request.number || github.event.check_suite.pull_requests[0].number }}
+          merge-method: squash
