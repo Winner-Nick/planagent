@@ -1,4 +1,10 @@
-"""Prompt structure / cache-alignment tests."""
+"""Prompt structure / cache-alignment tests.
+
+Verifies that the STABLE_PREFIX portion of the system prompt is byte-
+identical across different snapshots + now() values (so DeepSeek's prefix
+cache can hit), and that the volatile tail reflects actual runtime data
+(current speaker, their plans).
+"""
 
 from __future__ import annotations
 
@@ -7,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from planagent.agent.prompts import (
     VOLATILE_MARKER,
+    WHITEBOARD_MARKER,
     GroupSnapshot,
     make_prompt,
     stable_prefix_bytes,
@@ -21,8 +28,8 @@ def _snapshot_a() -> GroupSnapshot:
         wechat_group_id="wx-aaa",
         group_name="Alpha Squad",
         members=[
-            {"wechat_user_id": "u-peng", "display_name": "Peng"},
-            {"wechat_user_id": "u-bot", "display_name": "Bot"},
+            {"wechat_user_id": "u-peng", "display_name": "鹏鹏"},
+            {"wechat_user_id": "u-chenchen", "display_name": "辰辰"},
         ],
         plans=[
             {
@@ -30,8 +37,11 @@ def _snapshot_a() -> GroupSnapshot:
                 "title": "Rust",
                 "status": "draft",
                 "next_fire_at": "2026-05-01T08:00:00+08:00",
+                "owner_user_id": "u-peng",
             }
         ],
+        speaker_wechat_user_id="u-peng",
+        speaker_display_name="鹏鹏",
     )
 
 
@@ -65,14 +75,26 @@ def test_volatile_section_reflects_inputs() -> None:
     out = make_prompt(_snapshot_a(), now=t)
     assert VOLATILE_MARKER in out
     tail = out.split(VOLATILE_MARKER, 1)[1]
-    assert "Alpha Squad" in tail
-    assert "wx-aaa" in tail
-    assert "Peng" in tail
+    # Persona-era volatile renders the speaker by display name and their plans.
+    assert "鹏鹏" in tail
+    assert "辰辰" in tail
     assert "Rust" in tail
     assert t.isoformat() in tail
+    # PR-H whiteboard placeholder must be present so PR-H has a stable slot.
+    assert WHITEBOARD_MARKER in tail
 
 
 def test_make_prompt_same_snapshot_same_time_is_stable() -> None:
     t = datetime(2026, 4, 23, 9, 30, tzinfo=SH)
     snap = _snapshot_a()
     assert make_prompt(snap, now=t) == make_prompt(snap, now=t)
+
+
+def test_stable_prefix_contains_persona_rules() -> None:
+    prefix = stable_prefix_bytes().decode("utf-8")
+    # Sanity on persona invariants that fix the PR-G bugs.
+    assert "小计" in prefix
+    # Hard rule: empty content on tool-call messages.
+    assert "content 必须是空字符串" in prefix
+    # Must have the mandatory-reminder-after-start_at rule.
+    assert "schedule_reminder" in prefix

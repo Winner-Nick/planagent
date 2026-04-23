@@ -29,12 +29,21 @@ WechatSend = Callable[[str], Awaitable[None]]
 
 @dataclass
 class ToolContext:
-    """Request-scoped context threaded into every tool handler."""
+    """Request-scoped context threaded into every tool handler.
+
+    PR-G adds `sender_user_id` / `peer_user_id` so `create_plan_draft` can
+    default the plan owner to the current speaker without ever exposing raw
+    user_ids to the LLM. The agent passes `owner="speaker"` (default) or
+    `owner="peer"` by natural-language intent; the handler resolves the
+    string to a wechat_user_id locally.
+    """
 
     session_factory: async_sessionmaker
     group_id: str  # internal DB id
     wechat_group_id: str
     wechat_send: WechatSend
+    sender_user_id: str | None = None
+    peer_user_id: str | None = None
     sent_texts: list[str] = field(default_factory=list)
 
 
@@ -146,14 +155,30 @@ async def _create_plan_draft(
     ctx: ToolContext,
     *,
     title: str,
+    owner: str = "speaker",
+    # Back-compat for tests / callers still passing a raw wechat_user_id.
+    # The LLM never sees this — schema exposes only `owner`.
     owner_user_id: str | None = None,
 ) -> dict[str, Any]:
+    """Create a draft plan. Owner resolution:
+
+    - owner="speaker" (default): ctx.sender_user_id — the human who just wrote in.
+    - owner="peer": ctx.peer_user_id — the other known human in the logical group.
+    - owner_user_id kwarg (back-compat): passed through verbatim.
+    """
+    if owner_user_id is not None:
+        resolved_owner = owner_user_id
+    elif owner == "peer":
+        resolved_owner = ctx.peer_user_id
+    else:
+        # Default + "speaker" both resolve to the inbound sender.
+        resolved_owner = ctx.sender_user_id
     async with ctx.session_factory() as session:
         plan = Plan(
             group_id=ctx.group_id,
             title=title,
             status=PlanStatus.draft,
-            owner_user_id=owner_user_id,
+            owner_user_id=resolved_owner,
         )
         session.add(plan)
         await session.commit()
@@ -273,6 +298,10 @@ _PLAN_UPDATE_FIELDS_SCHEMA = {
         "Partial update of a Plan. Only include fields you want to change. "
         "Times must be ISO-8601 with timezone (prefer Asia/Shanghai +08:00)."
     ),
+    # PR-G: `owner_user_id` removed — the LLM must never see or set raw
+    # wechat_user_ids. Ownership is fixed at draft-time via create_plan_draft's
+    # `owner` parameter ("speaker" / "peer"). Re-assigning ownership is
+    # deferred to PR-H; there is no LLM path to change it in this PR.
     "properties": {
         "title": {"type": "string"},
         "description": {"type": "string"},
@@ -285,7 +314,6 @@ _PLAN_UPDATE_FIELDS_SCHEMA = {
             "description": "5-field crontab (m h dom mon dow). E.g. '0 20 * * 1-5'",
         },
         "priority": {"type": "integer"},
-        "owner_user_id": {"type": "string"},
         "metadata_json": {
             "type": "object",
             "description": "Free-form metadata; merged (not replaced).",
@@ -323,15 +351,24 @@ TOOL_REGISTRY: dict[str, Tool] = {
     "create_plan_draft": Tool(
         name="create_plan_draft",
         description=(
-            "Create a new plan in draft status for the current group. Use as "
-            "soon as you've confirmed a plan title; fill remaining fields "
-            "later via update_plan."
+            "创建一个草稿状态的计划。只要标题明确就立刻调用；剩下的字段用 "
+            "update_plan 慢慢补。**不用询问用户的 id**——当前说话人就是默认 "
+            "owner。除非用户明确把计划指向对方（比如「辰辰她自己的英语打卡」），"
+            "否则直接用默认值（owner='speaker'）。"
         ),
         parameters_schema={
             "type": "object",
             "properties": {
                 "title": {"type": "string"},
-                "owner_user_id": {"type": "string"},
+                "owner": {
+                    "type": "string",
+                    "enum": ["speaker", "peer"],
+                    "description": (
+                        "谁负责这个计划。speaker = 当前说话人（默认）；"
+                        "peer = 群里的另一个人。"
+                    ),
+                    "default": "speaker",
+                },
             },
             "required": ["title"],
         },
