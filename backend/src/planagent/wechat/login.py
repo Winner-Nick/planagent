@@ -52,15 +52,33 @@ def _save_qr_png(payload: str, path: Path) -> bool:
         return False
 
 
-def _scan_payload(session: QRCodeSession) -> str:
+def _scan_payload(session: QRCodeSession) -> str | None:
     """Pick the string to encode in the QR.
 
-    Prefer `qrcode_img_content` (the WeChat scan URL); fall back to the
-    polling token only if the server omits the URL — that fallback won't
-    actually log anyone in, but it still produces a renderable code for
-    diagnostics.
+    The server's `qrcode_img_content` can be one of two things depending
+    on deployment/bot_type: a scannable URL (typically
+    https://liteapp.weixin.qq.com/q/…?qrcode=…) or a base64-encoded PNG
+    of a QR the server already rendered. Only the URL form can be
+    re-encoded into a terminal QR code — base64 image bytes would just
+    produce an un-scannable blob. We detect the URL case; otherwise
+    signal None so callers fall back to the server-rendered PNG.
     """
-    return session.qrcode_img_content or session.qrcode
+    payload = session.qrcode_img_content
+    if payload and payload.startswith(("http://", "https://")):
+        return payload
+    return None
+
+
+def _save_server_png(session: QRCodeSession, path: Path) -> bool:
+    """Write the server-provided QR PNG to disk when the payload is base64."""
+    raw = session.qrcode_img_bytes
+    if not raw:
+        return False
+    try:
+        path.write_bytes(raw)
+        return True
+    except OSError:
+        return False
 
 
 async def run() -> int:
@@ -68,19 +86,28 @@ async def run() -> int:
         session = await client.get_login_qrcode()
         scan_url = _scan_payload(session)
 
-        print("Scan the QR code below in WeChat to log the bot in.")
-        if scan_url.startswith("http"):
-            print(f"(encoded payload: {scan_url})\n")
+        print("Scan the QR code below in WeChat to log the bot in.\n")
+        if scan_url is not None:
+            try:
+                _render_qr_terminal(scan_url)
+            except Exception:  # noqa: BLE001
+                print("(Could not render QR to terminal.)")
+            # Log the token shape without leaking the live scan credential:
+            # anyone with the full URL in a shared log/CI console could
+            # complete the auth instead of the operator.
+            print(f"\n(scan URL length={len(scan_url)}; token redacted)")
+            png_path = Path("./qrcode.png")
+            if _save_qr_png(scan_url, png_path):
+                print(f"QR image also written to {png_path}.")
         else:
-            print()
-        try:
-            _render_qr_terminal(scan_url)
-        except Exception:  # noqa: BLE001
-            print("(Could not render QR to terminal.)")
-
-        png_path = Path("./qrcode.png")
-        if _save_qr_png(scan_url, png_path):
-            print(f"\nQR image also written to {png_path}.")
+            # The server gave us a base64 PNG; re-encoding it as a QR
+            # would yield an un-scannable glyph. Save the server's image
+            # and point the operator at it.
+            png_path = Path("./qrcode.png")
+            if _save_server_png(session, png_path):
+                print(f"Server supplied a pre-rendered QR at {png_path} — open and scan.")
+            else:
+                print("Server returned no usable QR payload (neither URL nor image).")
 
         print("\nWaiting for scan confirmation (up to 180s)…")
         try:
