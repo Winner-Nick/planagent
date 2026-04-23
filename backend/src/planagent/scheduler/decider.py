@@ -124,8 +124,12 @@ async def decide(
     resp = await asyncio.to_thread(_call)
     content = resp.choices[0].message.content or "{}"
     data = json.loads(content)
+    # Strict bool: `"false"` / `"no"` / `0` must NOT round-trip to True.
+    # Accept only a JSON boolean; anything else is conservatively False.
+    raw_should = data.get("should_remind", False)
+    should_remind = raw_should is True
     return ReminderDecision(
-        should_remind=bool(data.get("should_remind", False)),
+        should_remind=should_remind,
         fire_at_local_iso=data.get("fire_at_local_iso"),
         message=data.get("message"),
         reason=data.get("reason"),

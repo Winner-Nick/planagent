@@ -126,9 +126,14 @@ class Scheduler:
                 continue
             if not dec.fire_at_local_iso or not dec.message:
                 continue
+            if not isinstance(dec.fire_at_local_iso, str):
+                log.warning(
+                    "plan %s: non-string fire_at_local_iso=%r", plan.id, dec.fire_at_local_iso
+                )
+                continue
             try:
                 fire_at_utc = datetime.fromisoformat(dec.fire_at_local_iso).astimezone(UTC)
-            except ValueError:
+            except (ValueError, TypeError):
                 log.warning(
                     "plan %s: un-parseable fire_at_local_iso=%r", plan.id, dec.fire_at_local_iso
                 )
