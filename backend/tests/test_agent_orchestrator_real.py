@@ -69,9 +69,11 @@ async def test_end_to_end_minimal_conversation(session_factory) -> None:
     # Seed two users so the agent sees a real group roster after the first msg.
     # (GroupContext gets created by the orchestrator on first inbound.)
 
-    # Turn 1: an incomplete plan request — expect at minimum a create_plan_draft
-    # AND (because required fields are missing) an ask_user_in_group, or the
-    # agent may batch more tool calls. We assert structural facts, not text.
+    # Turn 1: an incomplete plan request. The prompt rule is "if any required
+    # field is missing, ask one focused question and stop" — so the agent
+    # might legitimately ask about owner_user_id or recurrence instead of
+    # creating a draft. Accept either outcome here; turn 2 below nails down
+    # the full Plan assertion after we supply every required field.
     msg1 = _inbound(
         group_id="wx-rust",
         user_id="u-peng",
@@ -86,10 +88,14 @@ async def test_end_to_end_minimal_conversation(session_factory) -> None:
 
     async with session_factory() as session:
         plans = (await session.execute(select(Plan))).scalars().all()
-        assert len(plans) >= 1, "agent should have created at least one plan"
-        assert any("rust" in (p.title or "").lower() for p in plans), (
-            f"expected a Rust-ish plan title, got {[p.title for p in plans]}"
-        )
+        # Either a draft plan was created OR the agent asked a clarifying
+        # question — both are spec-compliant for the incomplete input.
+        if plans:
+            assert any("rust" in (p.title or "").lower() for p in plans), (
+                f"expected a Rust-ish plan title, got {[p.title for p in plans]}"
+            )
+        else:
+            assert sent, "agent produced neither a plan nor a spoken turn"
 
     # Turn 2: provide more context. Feed the likely-missing fields in one shot.
     msg2 = _inbound(

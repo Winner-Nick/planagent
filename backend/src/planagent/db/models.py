@@ -52,6 +52,8 @@ class GroupContext(Base):
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Kept for backward compatibility (pre-PR-F scheduler sends). PR-F moves the
+    # authoritative per-user token onto BotSession.last_context_token.
     last_context_token: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     members: Mapped[list[GroupMember]] = relationship(
@@ -63,6 +65,9 @@ class GroupContext(Base):
     turns: Mapped[list[ConversationTurn]] = relationship(
         back_populates="group", cascade="all, delete-orphan"
     )
+    bot_sessions: Mapped[list[BotSession]] = relationship(
+        back_populates="group", cascade="all, delete-orphan"
+    )
 
 
 class GroupMember(Base):
@@ -72,11 +77,65 @@ class GroupMember(Base):
     group_id: Mapped[str] = mapped_column(
         ForeignKey("group_contexts.id", ondelete="CASCADE"), nullable=False
     )
-    wechat_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    wechat_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     display_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
     is_bot: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     group: Mapped[GroupContext] = relationship(back_populates="members")
+
+
+class BotSession(Base):
+    """One logical 1:1 ClawBot chat, emulating a member of the fake group.
+
+    The ClawBot platform doesn't support real group chat on personal WeChat, so
+    we fan out a "group" as N independent 1:1 sessions that share a logical
+    `group_id`. Each BotSession has its own bot_token (one ClawBot per user),
+    its own last_inbound_at / last_outbound_at (for the 24h keep-alive window),
+    and its own `last_context_token` — the ClawBot protocol threads replies on
+    that token, and it's scoped per user, NOT per group.
+    """
+
+    __tablename__ = "bot_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    group_id: Mapped[str] = mapped_column(
+        ForeignKey("group_contexts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # Credential-file friendly label (e.g. "peng", "chenchen"). Unique so the
+    # bootstrap loader can upsert by filename.
+    name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    # Starts NULL — we don't know the user's wechat_user_id until their first
+    # inbound message arrives. Runtime fills it in, and it becomes unique.
+    wechat_user_id: Mapped[str | None] = mapped_column(
+        String(128), unique=True, nullable=True, index=True
+    )
+    bot_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    bot_token: Mapped[str] = mapped_column(String(512), nullable=False)
+    baseurl: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    display_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    last_inbound_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_outbound_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_wakeup_ping_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Context token from this user's most recent inbound — required for any
+    # scheduler-originated (no-live-message) send. Per-session because ClawBot
+    # scopes context tokens to the conversation, not to our logical group.
+    last_context_token: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+    group: Mapped[GroupContext] = relationship(back_populates="bot_sessions")
 
 
 class Plan(Base):
