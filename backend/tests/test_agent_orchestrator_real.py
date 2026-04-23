@@ -129,7 +129,10 @@ async def test_end_to_end_minimal_conversation(session_factory) -> None:
         msg3 = _inbound(
             group_id="wx-rust",
             user_id="u-peng",
-            text="就按上面那段原样执行 create_plan_draft + update_plan + schedule_reminder，别再追问了。",
+            text=(
+                "就按上面那段原样执行 "
+                "create_plan_draft + update_plan + schedule_reminder，别再追问了。"
+            ),
             context_token="ctx-3",
         )
         await handle_inbound(
