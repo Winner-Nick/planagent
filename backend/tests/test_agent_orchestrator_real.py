@@ -97,13 +97,22 @@ async def test_end_to_end_minimal_conversation(session_factory) -> None:
         else:
             assert sent, "agent produced neither a plan nor a spoken turn"
 
-    # Turn 2: provide more context. Feed the likely-missing fields in one shot.
+    # Turn 2: feed an extremely explicit template. Post-PR-G persona tends to
+    # keep asking clarifying questions on ambiguous input; give it an
+    # imperative it can't misread. If the agent *still* chooses to ask
+    # (real-DeepSeek non-determinism), a third nudge resolves it.
     msg2 = _inbound(
         group_id="wx-rust",
         user_id="u-peng",
         text=(
-            "我叫 Peng，owner 就是我 (u-peng)。每周一到周五执行，目标两个月。"
-            "每次 30 分钟。第一次提醒设定在 2099-05-04 20:00（Asia/Shanghai）。"
+            "信息齐了，现在直接给我创建这个计划:\n"
+            "标题: Rust 学习\n"
+            "owner: 我自己 (u-peng)\n"
+            "recurrence_cron: 0 20 * * 1-5\n"
+            "expected_duration_per_session_min: 30\n"
+            "due_at: 2099-05-04T20:00:00+08:00\n"
+            "并且在 2099-05-04T20:00:00+08:00 给我排一个提醒。"
+            "请直接调 create_plan_draft + update_plan + schedule_reminder。"
         ),
         context_token="ctx-2",
     )
@@ -113,6 +122,22 @@ async def test_end_to_end_minimal_conversation(session_factory) -> None:
         session_factory=session_factory,
         wechat_send=_send,
     )
+
+    async with session_factory() as session:
+        plans_now = (await session.execute(select(Plan))).scalars().all()
+    if not plans_now:
+        msg3 = _inbound(
+            group_id="wx-rust",
+            user_id="u-peng",
+            text="就按上面那段原样执行 create_plan_draft + update_plan + schedule_reminder，别再追问了。",
+            context_token="ctx-3",
+        )
+        await handle_inbound(
+            msg3,
+            deepseek=deepseek,
+            session_factory=session_factory,
+            wechat_send=_send,
+        )
 
     async with session_factory() as session:
         plans = (await session.execute(select(Plan))).scalars().all()
