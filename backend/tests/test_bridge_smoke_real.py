@@ -82,7 +82,7 @@ async def test_bridge_handler_creates_plan_and_sends_reply(sm) -> None:
     # Bootstrap one session for "peng".
     await sync_sessions_to_db(
         sm,
-        [SessionCredential(name="stubby", bot_token="tok-peng", baseurl=None)],
+        [SessionCredential(name="peng", bot_token="tok-peng", baseurl=None)],
     )
     async with sm() as session:
         bs = (await session.execute(select(BotSession))).scalar_one()
@@ -91,7 +91,7 @@ async def test_bridge_handler_creates_plan_and_sends_reply(sm) -> None:
     client = _CaptureClient()
     deepseek = DeepSeekClient()
     spec = SessionPollSpec(
-        session_id=session_db_id, bot_token="tok-peng", name="stubby"
+        session_id=session_db_id, bot_token="tok-peng", name="peng"
     )
     handler = build_handler_for_session(
         deepseek=deepseek,
@@ -162,7 +162,7 @@ async def test_bridge_handler_sets_last_inbound_within_recent_seconds(sm) -> Non
     """Subset of the above focused only on runtime stamping — cheaper."""
     await sync_sessions_to_db(
         sm,
-        [SessionCredential(name="stubby", bot_token="tok-peng", baseurl=None)],
+        [SessionCredential(name="peng", bot_token="tok-peng", baseurl=None)],
     )
     async with sm() as session:
         bs = (await session.execute(select(BotSession))).scalar_one()
@@ -170,7 +170,7 @@ async def test_bridge_handler_sets_last_inbound_within_recent_seconds(sm) -> Non
 
     client = _CaptureClient()
     spec = SessionPollSpec(
-        session_id=session_db_id, bot_token="tok-peng", name="stubby"
+        session_id=session_db_id, bot_token="tok-peng", name="peng"
     )
     handler = build_handler_for_session(
         deepseek=DeepSeekClient(),
