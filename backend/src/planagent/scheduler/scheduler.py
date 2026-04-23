@@ -128,6 +128,15 @@ class Scheduler:
             {p.group_id for p in plans}
         )
 
+        # PR-G safety net (fixes bug #4): if a plan has start_at inside this
+        # tick window but no pending Reminder near that time, auto-materialize
+        # one. The persona prompt tells the agent to always schedule a
+        # reminder alongside start_at/due_at, but we backstop in case the
+        # LLM skipped. Materializing here is cheap and idempotent (same
+        # fire_at bucket as `_insert_reminder_if_absent`).
+        for p in plans:
+            await self._ensure_start_at_reminder(p, now=now, window_end=window_end)
+
         # Ask the LLM per plan (bounded concurrency).
         async def _one(plan: Plan) -> tuple[Plan, ReminderDecision | None]:
             async with self._sem:
@@ -251,6 +260,36 @@ class Scheduler:
                 .limit(3)
             )
             return list(result.scalars().all())
+
+    async def _ensure_start_at_reminder(
+        self, plan: Plan, *, now: datetime, window_end: datetime
+    ) -> None:
+        """Materialize a Reminder for plan.start_at if inside the tick window.
+
+        This is a safety net for cases where the agent wrote `start_at` but
+        forgot to call `schedule_reminder`. Covers both past-but-recent
+        (fire within the last slack interval) and the near future up to
+        `window_end`. No-op if a pending/sent reminder already exists near
+        that fire time — bucketed by `_insert_reminder_if_absent`'s own
+        dedupe logic.
+        """
+        start_at = plan.start_at
+        if start_at is None:
+            return
+        if start_at.tzinfo is None:
+            start_at = start_at.replace(tzinfo=UTC)
+        # Only nudge for imminent starts (not something 3 months out).
+        if start_at < now - self._slack:
+            return
+        if start_at > window_end:
+            return
+        # Compose a pragmatic Chinese fallback message. The prompt asked the
+        # agent to schedule its own better-worded one; this is the safety net.
+        local = start_at.astimezone(BEIJING)
+        msg = (
+            f"（系统兜底）到 {local.strftime('%H:%M')} 啦，记得开始「{plan.title}」"
+        )
+        await self._insert_reminder_if_absent(plan.id, start_at, msg)
 
     async def _insert_reminder_if_absent(
         self, plan_id: str, fire_at_utc: datetime, message: str

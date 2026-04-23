@@ -7,6 +7,13 @@ from openai import OpenAI
 
 from planagent.config import Settings, get_settings
 
+# PR-G: DeepSeek's `thinking` API accepts {"type": "enabled"|"disabled"}.
+# Docs: https://api-docs.deepseek.com/zh-cn/api/create-chat-completion
+# We default to DISABLED because the reasoning channel otherwise gets written
+# into `content`, which leaks chain-of-thought into the user-visible reply —
+# see bug #2 of PR-G. Callers that explicitly want reasoning can override.
+_DEFAULT_THINKING: dict[str, Any] = {"type": "disabled"}
+
 
 class DeepSeekClient:
     """Thin wrapper over the OpenAI SDK pointed at DeepSeek.
@@ -36,6 +43,7 @@ class DeepSeekClient:
         tool_choice: str | dict[str, Any] | None = None,
         temperature: float = 0.2,
         response_format: dict[str, Any] | None = None,
+        thinking: dict[str, Any] | None = None,
     ) -> Any:
         kwargs: dict[str, Any] = {
             "model": self.model,
@@ -48,4 +56,11 @@ class DeepSeekClient:
             kwargs["tool_choice"] = tool_choice
         if response_format is not None:
             kwargs["response_format"] = response_format
+
+        # `thinking` rides in `extra_body` because the OpenAI SDK doesn't
+        # surface DeepSeek-specific fields. Always pass a default of
+        # `disabled` so chain-of-thought never leaks into `content`; callers
+        # can pass `thinking={"type": "enabled"}` to opt back in.
+        effective_thinking = thinking if thinking is not None else _DEFAULT_THINKING
+        kwargs["extra_body"] = {"thinking": effective_thinking}
         return self._client.chat.completions.create(**kwargs)

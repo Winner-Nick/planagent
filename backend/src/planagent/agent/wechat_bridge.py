@@ -87,14 +87,24 @@ async def _stamp_session_inbound(
         if bs.wechat_user_id is None and from_user:
             bs.wechat_user_id = from_user
             # Fold the same value into the matching GroupMember row so the
-            # orchestrator's snapshot sees it immediately.
+            # orchestrator's snapshot sees it immediately. PR-G preferred
+            # match is by wechat_user_id (pre-filled for known humans);
+            # legacy fallback is by cred.name in display_name.
             mres = await session.execute(
                 select(GroupMember).where(
                     GroupMember.group_id == bs.group_id,
-                    GroupMember.display_name == bs.name,
+                    GroupMember.wechat_user_id == from_user,
                 )
             )
             member = mres.scalar_one_or_none()
+            if member is None:
+                mres2 = await session.execute(
+                    select(GroupMember).where(
+                        GroupMember.group_id == bs.group_id,
+                        GroupMember.display_name == bs.name,
+                    )
+                )
+                member = mres2.scalar_one_or_none()
             if member is not None and member.wechat_user_id != from_user:
                 member.wechat_user_id = from_user
         if bs.bot_user_id is None and msg.to_user_id:

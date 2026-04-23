@@ -42,6 +42,12 @@ class ConversationRole(str, enum.Enum):  # noqa: UP042
     system = "system"
 
 
+class PendingOutboundStatus(str, enum.Enum):  # noqa: UP042
+    pending = "pending"
+    delivered = "delivered"
+    cancelled = "cancelled"
+
+
 class GroupContext(Base):
     __tablename__ = "group_contexts"
 
@@ -193,6 +199,16 @@ class Reminder(Base):
 
 
 class ConversationTurn(Base):
+    """Single row in the per-group conversation log.
+
+    PR-G split: `user_id` semantically means **speaker_user_id** (who said this
+    turn / whose inbound triggered this assistant-or-tool row). `target_user_id`
+    is the user the orchestrator was replying TO on this turn. For user rows
+    those two are identical; for assistant/tool rows generated while handling
+    speaker X, both are X. This lets history loading filter by the
+    current speaker and avoid cross-user contamination.
+    """
+
     __tablename__ = "conversation_turns"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
@@ -202,7 +218,14 @@ class ConversationTurn(Base):
     role: Mapped[ConversationRole] = mapped_column(
         Enum(ConversationRole, name="conversation_role"), nullable=False
     )
+    # Semantically "speaker_user_id" — keeping the physical name stable so
+    # existing callers / queries don't break. Use the `speaker_user_id`
+    # property below for readability.
     user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # PR-G: added. For role=user, mirrors `user_id`. For assistant/tool,
+    # identifies the user this reply is addressed to (i.e. the speaker of
+    # the inbound that this handler invocation is processing).
+    target_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     content: Mapped[str | None] = mapped_column(Text, nullable=True)
     tool_calls_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     tool_call_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -212,3 +235,39 @@ class ConversationTurn(Base):
     )
 
     group: Mapped[GroupContext] = relationship(back_populates="turns")
+
+    @property
+    def speaker_user_id(self) -> str | None:
+        """Readability alias for `user_id` — the speaker on this turn."""
+        return self.user_id
+
+
+class PendingOutbound(Base):
+    """Queued outbound text awaiting a user's wake-up window.
+
+    Skeleton in PR-G: PR-H will route cross-user notifications through this
+    table (e.g. Peng tells 小计 "告诉辰辰晚上一起复盘一下" and it lands here
+    until 辰辰 next pings the bot). Defined now so PR-H doesn't need another
+    migration.
+    """
+
+    __tablename__ = "pending_outbound"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    group_id: Mapped[str] = mapped_column(
+        ForeignKey("group_contexts.id", ondelete="CASCADE"), nullable=False
+    )
+    target_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    author_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    delivered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    status: Mapped[PendingOutboundStatus] = mapped_column(
+        Enum(PendingOutboundStatus, name="pending_outbound_status"),
+        default=PendingOutboundStatus.pending,
+        nullable=False,
+    )

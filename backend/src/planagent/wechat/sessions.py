@@ -27,6 +27,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from planagent.db.models import BotSession, GroupContext, GroupMember
+from planagent.wechat.constants import KNOWN_HUMANS
 
 log = logging.getLogger(__name__)
 
@@ -111,6 +112,30 @@ async def sync_sessions_to_db(
             session.add(group)
             await session.flush()
 
+        # PR-G: pre-fill GroupMember rows for every known human so the
+        # orchestrator's prompt can address them by display_name from the
+        # first inbound — no more "your user_id is ...?" prompts (bug #1).
+        # Keyed by wechat_user_id which is stable.
+        for human in KNOWN_HUMANS:
+            hres = await session.execute(
+                select(GroupMember).where(
+                    GroupMember.group_id == group.id,
+                    GroupMember.wechat_user_id == human.wechat_user_id,
+                )
+            )
+            row = hres.scalar_one_or_none()
+            if row is None:
+                session.add(
+                    GroupMember(
+                        group_id=group.id,
+                        wechat_user_id=human.wechat_user_id,
+                        display_name=human.display_name,
+                        is_bot=False,
+                    )
+                )
+            elif row.display_name != human.display_name:
+                row.display_name = human.display_name
+
         out_ids: list[str] = []
         for cred in creds:
             bres = await session.execute(
@@ -133,26 +158,29 @@ async def sync_sessions_to_db(
                 # Keep existing group linkage; don't reparent.
             out_ids.append(bs.id)
 
-            # Ensure a GroupMember row exists for this session's user. We key
-            # by BotSession.name in the display_name slot so we can locate it
-            # even before wechat_user_id is known.
-            mres = await session.execute(
-                select(GroupMember).where(
-                    GroupMember.group_id == group.id,
-                    GroupMember.display_name == cred.name,
-                )
-            )
-            member = mres.scalar_one_or_none()
-            if member is None:
-                session.add(
-                    GroupMember(
-                        group_id=group.id,
-                        wechat_user_id=bs.wechat_user_id,
-                        display_name=cred.name,
+            # PR-G: known humans were already pre-filled above by
+            # wechat_user_id. Only fall back to the legacy "member keyed by
+            # cred.name" path for creds we don't recognize (future third
+            # user, test deployment, etc.), to avoid duplicate member rows.
+            cred_is_known = any(h.cred_name == cred.name for h in KNOWN_HUMANS)
+            if not cred_is_known:
+                mres = await session.execute(
+                    select(GroupMember).where(
+                        GroupMember.group_id == group.id,
+                        GroupMember.display_name == cred.name,
                     )
                 )
-            elif bs.wechat_user_id and member.wechat_user_id != bs.wechat_user_id:
-                member.wechat_user_id = bs.wechat_user_id
+                member = mres.scalar_one_or_none()
+                if member is None:
+                    session.add(
+                        GroupMember(
+                            group_id=group.id,
+                            wechat_user_id=bs.wechat_user_id,
+                            display_name=cred.name,
+                        )
+                    )
+                elif bs.wechat_user_id and member.wechat_user_id != bs.wechat_user_id:
+                    member.wechat_user_id = bs.wechat_user_id
         await session.commit()
         return out_ids
 

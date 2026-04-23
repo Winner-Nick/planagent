@@ -69,15 +69,20 @@ async def test_sync_sessions_to_db_is_idempotent(sm) -> None:
     ids1 = await sync_sessions_to_db(sm, creds)
     assert len(ids1) == 2
 
-    # One group, two sessions, two members.
+    # One group, two sessions, two members. PR-G pre-fills members for the
+    # known humans (鹏鹏 / 辰辰) with their real wechat_user_id attached —
+    # so the display_name set uses Chinese names, not the cred filenames,
+    # and wechat_user_id is already populated before any inbound arrives.
     async with sm() as session:
         groups = (await session.execute(select(GroupContext))).scalars().all()
         assert len(groups) == 1
         sessions_rows = (await session.execute(select(BotSession))).scalars().all()
         assert {s.name for s in sessions_rows} == {"peng", "chenchen"}
         members = (await session.execute(select(GroupMember))).scalars().all()
-        assert {m.display_name for m in members} == {"peng", "chenchen"}
-        assert all(m.wechat_user_id is None for m in members)
+        assert {m.display_name for m in members} == {"鹏鹏", "辰辰"}
+        uids = {m.wechat_user_id for m in members}
+        assert "o9cq807dznGxf81R2JoVl2pEx_T0@im.wechat" in uids
+        assert "o9cq80ydQIR4ZaYl6vXvDp_4KklQ@im.wechat" in uids
 
     # Re-run with a rotated token — existing rows refreshed, no duplicates.
     creds2 = [
