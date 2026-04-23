@@ -180,3 +180,13 @@ def test_build_headers_structure_and_rotation() -> None:
     # Vanishingly unlikely to repeat across two calls (2^32 space).
     rotations = {build_headers("tok-abc")["X-WECHAT-UIN"] for _ in range(4)}
     assert len(rotations) > 1
+
+
+def test_build_headers_omits_authorization_when_token_empty() -> None:
+    """Pre-login calls pass no bot_token. Emitting "Bearer " would be
+    rejected by httpx as an illegal header value.
+    """
+    h = build_headers("")
+    assert "Authorization" not in h
+    assert h["AuthorizationType"] == "ilink_bot_token"
+    assert "X-WECHAT-UIN" in h
