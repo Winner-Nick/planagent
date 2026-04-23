@@ -517,6 +517,7 @@ async def handle_inbound(
                 tool_calls_json={"tool_calls": assistant_entry["tool_calls"]},
             )
 
+            buffer_len_before_round = len(deferred.buffer)
             for tc in tool_calls:
                 if tc.function.name in SPOKEN_TOOL_NAMES:
                     called_spoken_tool = True
@@ -537,6 +538,14 @@ async def handle_inbound(
                     target_user_id=speaker_user_id,
                     tool_call_id=tc.id,
                 )
+            # Early termination: break only if a spoken tool *actually*
+            # produced buffered output this round. A spoken tool that
+            # errored out (bad_arguments, whitespace-only text filtered
+            # by the DeferredSender, …) doesn't count — the LLM still
+            # needs a chance to recover, or the user gets silence.
+            spoke_this_round = len(deferred.buffer) > buffer_len_before_round
+            if called_spoken_tool and spoke_this_round:
+                break
             continue
 
         # No tool calls: this is the terminal assistant message.
