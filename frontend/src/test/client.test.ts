@@ -36,6 +36,7 @@ describe("api client fixture round-trip", () => {
     // Route through the live-API path (disable fixtures) with a stubbed fetch
     // that mimics FastAPI's 204 No Content. httpJson must not call res.json()
     // on an empty body — doing so would throw despite a valid server response.
+    // Live path = any value other than "1" (see client.ts::useFixtures).
     const origEnv = import.meta.env.VITE_USE_FIXTURES;
     const origFetch = globalThis.fetch;
     try {

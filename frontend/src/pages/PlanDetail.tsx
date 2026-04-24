@@ -23,7 +23,13 @@ import { Textarea } from "../components/ui/textarea";
 import { cn } from "../lib/utils";
 import { formatDate, formatRecurrence, priorityColor } from "../lib/format";
 
-const STATUSES: PlanStatus[] = ["draft", "active", "completed", "paused"];
+const STATUSES: PlanStatus[] = [
+  "draft",
+  "active",
+  "overdue",
+  "completed",
+  "paused",
+];
 const PRIORITIES: PlanPriority[] = ["low", "medium", "high"];
 
 export function PlanDetail() {

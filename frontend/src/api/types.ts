@@ -1,7 +1,16 @@
 // Types mirror the PlanAgent backend schemas. All identifiers are string,
 // all timestamps are ISO-8601 strings, and status fields use union literals.
 
-export type PlanStatus = "draft" | "active" | "completed" | "paused";
+// Known plan statuses. Backend may add more lanes (e.g. PR-I introduces
+// `overdue`); the board widens this union eagerly and renders any future
+// unknown status under an "其他" (other) bucket, so the UI never crashes
+// when a new server enum lands before the client is redeployed.
+export type PlanStatus =
+  | "draft"
+  | "active"
+  | "overdue"
+  | "completed"
+  | "paused";
 
 export type PlanPriority = "low" | "medium" | "high";
 

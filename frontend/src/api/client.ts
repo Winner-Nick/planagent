@@ -17,9 +17,10 @@ import type {
 const FIXTURE_DELAY_MS = 50;
 
 function useFixtures(): boolean {
-  // Default ON so `npm run dev` is self-contained; set VITE_USE_FIXTURES=0
-  // to point the UI at a live backend.
-  return import.meta.env.VITE_USE_FIXTURES !== "0";
+  // Default OFF: `npm run dev` talks to the live FastAPI bridge at
+  // VITE_API_BASE (defaults to http://localhost:8000) so operators see
+  // real plans. Set VITE_USE_FIXTURES=1 for offline demos and tests.
+  return import.meta.env.VITE_USE_FIXTURES === "1";
 }
 
 function apiBase(): string {

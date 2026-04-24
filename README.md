@@ -26,6 +26,35 @@ uvicorn planagent.main:app --reload
 cd frontend && npm run dev
 ```
 
+## Live dev
+
+The React dashboard talks to the live FastAPI bridge by default (no fixtures).
+Run three terminals:
+
+```bash
+# Terminal 1 — FastAPI (serves /api/v1, enables CORS for :5173)
+cd backend && uvicorn planagent.main:app --reload
+
+# Terminal 2 — WeChat bridge (writes plans into the shared SQLite DB)
+cd backend && python -m planagent.wechat.bridge
+
+# Terminal 3 — React dashboard, reads VITE_API_BASE from .env.development
+cd frontend && npm run dev
+```
+
+Then open http://localhost:5173. The Plans board groups cards by owner
+(鹏鹏 / 辰辰) and shows each plan's next reminder fire time.
+
+Switches:
+
+- `VITE_API_BASE` — backend origin (default `http://localhost:8000`).
+- `VITE_USE_FIXTURES=1` — serve offline fixture data instead of hitting the
+  backend. Use this for screenshots, tests, or demoing without the bot
+  running. Any other value (including unset) means live mode.
+
+When live mode cannot reach the backend the UI renders an inline
+「后端未连接」 banner instead of crashing.
+
 ## Stack
 
 - Backend: Python 3.11, FastAPI, SQLAlchemy, APScheduler
