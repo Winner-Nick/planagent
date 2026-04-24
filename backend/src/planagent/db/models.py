@@ -26,6 +26,12 @@ class PlanStatus(str, enum.Enum):  # noqa: UP042
     active = "active"
     completed = "completed"
     paused = "paused"
+    # PR-I: added. `overdue` is scheduler-driven (non-recurring active plans
+    # whose due_at passed the grace window become overdue); `cancelled` is
+    # user-intent-driven (via the `cancel_plan` tool) so we preserve the row
+    # for audit instead of deleting it.
+    overdue = "overdue"
+    cancelled = "cancelled"
 
 
 class ReminderStatus(str, enum.Enum):  # noqa: UP042

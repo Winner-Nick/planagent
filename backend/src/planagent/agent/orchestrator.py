@@ -166,11 +166,21 @@ async def _load_snapshot(
             for m in members_rows
         ]
 
+        # PR-I: include `overdue` alongside draft/active/paused so the volatile
+        # speaker block shows the ⚠️ badge. Completed / cancelled rows stay
+        # hidden (noisy; the whiteboard covers them via counts).
         pres = await session.execute(
             select(Plan)
             .where(
                 Plan.group_id == group_id,
-                Plan.status.in_([PlanStatus.draft, PlanStatus.active, PlanStatus.paused]),
+                Plan.status.in_(
+                    [
+                        PlanStatus.draft,
+                        PlanStatus.active,
+                        PlanStatus.paused,
+                        PlanStatus.overdue,
+                    ]
+                ),
             )
             .order_by(Plan.created_at.desc())
         )
@@ -451,11 +461,16 @@ async def _build_whiteboard(
     peer_last_inbound_at: datetime | None = None
     peer_open_plans = 0
     peer_overdue = 0
+    peer_completed_today = 0
     plans_by_owner: dict[str, list[dict[str, Any]]] = {}
     unconsumed_notes: list[dict[str, Any]] = []
     consumable_ids: list[str] = []
 
     now_utc = datetime.now(UTC)
+    # 00:00 Asia/Shanghai → UTC cutoff, for today-completion count.
+    now_local = now_utc.astimezone(SHANGHAI)
+    start_of_today_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_of_today_utc = start_of_today_local.astimezone(UTC)
     async with session_factory() as session:
         if peer_uid:
             bs_res = await session.execute(
@@ -468,11 +483,9 @@ async def _build_whiteboard(
                     la = la.replace(tzinfo=UTC)
                 peer_last_inbound_at = la.astimezone(SHANGHAI)
 
-            open_statuses = [
-                PlanStatus.draft,
-                PlanStatus.active,
-                PlanStatus.paused,
-            ]
+            # PR-I: open = draft + active (what still needs active care).
+            # overdue, paused and cancelled are counted / ignored separately.
+            open_statuses = [PlanStatus.draft, PlanStatus.active]
             pres = await session.execute(
                 select(Plan).where(
                     Plan.group_id == group_id,
@@ -480,14 +493,26 @@ async def _build_whiteboard(
                     Plan.status.in_(open_statuses),
                 )
             )
-            open_plans = list(pres.scalars().all())
-            peer_open_plans = len(open_plans)
-            for p in open_plans:
-                if p.due_at is None:
-                    continue
-                due = p.due_at if p.due_at.tzinfo is not None else p.due_at.replace(tzinfo=UTC)
-                if due < now_utc:
-                    peer_overdue += 1
+            peer_open_plans = len(list(pres.scalars().all()))
+
+            ores = await session.execute(
+                select(Plan).where(
+                    Plan.group_id == group_id,
+                    Plan.owner_user_id == peer_uid,
+                    Plan.status == PlanStatus.overdue,
+                )
+            )
+            peer_overdue = len(list(ores.scalars().all()))
+
+            cres = await session.execute(
+                select(Plan).where(
+                    Plan.group_id == group_id,
+                    Plan.owner_user_id == peer_uid,
+                    Plan.status == PlanStatus.completed,
+                    Plan.updated_at >= start_of_today_utc,
+                )
+            )
+            peer_completed_today = len(list(cres.scalars().all()))
 
         # Plans-by-owner summary for the rendered board. Keyed by display
         # name so the prompt reads naturally; lists are small (we filter
@@ -547,6 +572,7 @@ async def _build_whiteboard(
         peer_last_inbound_at=peer_last_inbound_at,
         peer_open_plans=peer_open_plans,
         peer_overdue_count=peer_overdue,
+        peer_completed_today=peer_completed_today,
         unconsumed_notes=unconsumed_notes,
         plans_by_owner=plans_by_owner,
     )

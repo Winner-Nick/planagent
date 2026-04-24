@@ -192,6 +192,51 @@ def _serialize_reminder(r: Reminder) -> dict[str, Any]:
     }
 
 
+def _normalize_cron(raw: str) -> tuple[str, str | None]:
+    """Validate + normalize a cron string to 5-field form.
+
+    Accepts:
+      - 5-field: "m h dom mon dow" (passes through unchanged).
+      - 6-field: "s m h dom mon dow" where the leading field is a plain
+        numeric seconds value (0-59). The seconds field is dropped and a
+        warning is surfaced to the caller. APScheduler + our Reminder
+        timing use minute precision, so carrying seconds is both misleading
+        (LLM sometimes writes `0 50 9 * * *` expecting "09:50:00" but the
+        5-field parser would read it as "min=0 hour=50" — invalid) and
+        unnecessary.
+
+    Raises ValueError on any other shape.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(f"invalid cron: expected string, got {type(raw).__name__}")
+    cleaned = raw.strip()
+    if not cleaned:
+        raise ValueError("invalid cron: empty string")
+    fields = cleaned.split()
+    if len(fields) == 5:
+        return cleaned, None
+    if len(fields) == 6:
+        seconds = fields[0]
+        # Only strip when the leading field is a clean integer in [0, 59].
+        # Anything else (ranges, `*`, step) we reject — it likely means the
+        # caller is in a non-standard 6-field dialect we don't want to guess.
+        try:
+            sec_int = int(seconds)
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid cron: 6-field form requires numeric seconds, got {seconds!r}"
+            ) from exc
+        if not 0 <= sec_int <= 59:
+            raise ValueError(
+                f"invalid cron: seconds field out of range 0-59, got {sec_int}"
+            )
+        normalized = " ".join(fields[1:])
+        return normalized, "cron normalized: dropped leading seconds field"
+    raise ValueError(
+        f"invalid cron: expected 5 fields (m h dom mon dow), got {len(fields)}"
+    )
+
+
 def _parse_iso_to_utc(value: str) -> datetime:
     """Accept an ISO-8601 string with or without tz; return tz-aware UTC."""
     dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -285,6 +330,19 @@ async def _create_plan_draft(
 async def _update_plan(
     ctx: ToolContext, *, plan_id: str, fields: dict[str, Any]
 ) -> dict[str, Any]:
+    # PR-I: normalize cron BEFORE pydantic validation so a 6-field form
+    # gets corrected to 5-field (with a warning surfaced to the agent),
+    # and a malformed cron turns into a clean validation_error instead of
+    # silently persisting bad state.
+    cron_warning: str | None = None
+    if isinstance(fields, dict) and "recurrence_cron" in fields:
+        raw_cron = fields["recurrence_cron"]
+        if raw_cron is not None:
+            try:
+                normalized, cron_warning = _normalize_cron(raw_cron)
+            except ValueError as exc:
+                return {"error": "validation_error", "detail": str(exc)}
+            fields = {**fields, "recurrence_cron": normalized}
     # Validate the fields payload against PlanUpdate semantics.
     try:
         update = PlanUpdate.model_validate(fields)
@@ -304,7 +362,10 @@ async def _update_plan(
                 setattr(plan, k, v)
         await session.commit()
         await session.refresh(plan)
-        return _serialize_plan(plan)
+        result = _serialize_plan(plan)
+        if cron_warning:
+            result = {**result, "warning": cron_warning}
+        return result
 
 
 async def _mark_plan_complete(ctx: ToolContext, *, plan_id: str) -> dict[str, Any]:
@@ -325,6 +386,26 @@ async def _mark_plan_complete(ctx: ToolContext, *, plan_id: str) -> dict[str, An
             "status": plan.status.value,
             "cheer": _next_cheer(),
         }
+
+
+async def _cancel_plan(ctx: ToolContext, *, plan_id: str) -> dict[str, Any]:
+    """Mark a plan as `cancelled`. Row is preserved for audit.
+
+    PR-I: prefer this over `delete_plan` when the user explicitly says
+    "算了 / 取消吧 / 不做了". Deleting loses history; cancelling keeps it
+    so the peer whiteboard / later "how many cancelled plans" queries are
+    answerable. Status transition is purely local (no scheduler / reminder
+    side-effects) — any pending reminders remain on disk but the overdue
+    sweep ignores non-active plans so they won't auto-flip back.
+    """
+    async with ctx.session_factory() as session:
+        plan = await _fetch_plan_in_group(session, ctx, plan_id)
+        if plan is None:
+            return {"error": "plan_not_found", "plan_id": plan_id}
+        plan.status = PlanStatus.cancelled
+        await session.commit()
+        await session.refresh(plan)
+        return _serialize_plan(plan)
 
 
 async def _delete_plan(ctx: ToolContext, *, plan_id: str) -> dict[str, Any]:
@@ -462,9 +543,16 @@ async def _peek_peer_state(ctx: ToolContext, *, peer: str) -> dict[str, Any]:
         return {"error": "no_sender_context"}
     # Local import to avoid a cycle: BotSession lives in db.models but we
     # reference it only here.
+    from zoneinfo import ZoneInfo
+
     from planagent.db.models import BotSession
 
     now_utc = datetime.now(UTC)
+    # 00:00 Asia/Shanghai → UTC cutoff, for today-completion count.
+    shanghai = ZoneInfo("Asia/Shanghai")
+    now_local = now_utc.astimezone(shanghai)
+    start_of_today_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_of_today_utc = start_of_today_local.astimezone(UTC)
     async with ctx.session_factory() as session:
         bs_res = await session.execute(
             select(BotSession).where(BotSession.wechat_user_id == peer_uid)
@@ -474,8 +562,11 @@ async def _peek_peer_state(ctx: ToolContext, *, peer: str) -> dict[str, Any]:
         if bs is not None and bs.last_inbound_at is not None:
             last_inbound_at_iso = bs.last_inbound_at.isoformat()
 
-        open_statuses = [PlanStatus.draft, PlanStatus.active, PlanStatus.paused]
-        open_plans_count = (
+        # PR-I split: open = draft + active (things that still need the
+        # agent's care). Paused is user-parked, not "open load"; overdue
+        # is its own bucket; cancelled is audit-only and excluded here.
+        open_statuses = [PlanStatus.draft, PlanStatus.active]
+        open_rows = (
             await session.execute(
                 select(Plan).where(
                     Plan.group_id == ctx.group_id,
@@ -485,18 +576,26 @@ async def _peek_peer_state(ctx: ToolContext, *, peer: str) -> dict[str, Any]:
             )
         ).scalars().all()
 
-        # Overdue: plan has a due_at in the past AND status is not completed.
-        overdue_rows = [
-            p
-            for p in open_plans_count
-            if p.due_at is not None
-            and (
-                p.due_at
-                if p.due_at.tzinfo is not None
-                else p.due_at.replace(tzinfo=UTC)
+        overdue_rows = (
+            await session.execute(
+                select(Plan).where(
+                    Plan.group_id == ctx.group_id,
+                    Plan.owner_user_id == peer_uid,
+                    Plan.status == PlanStatus.overdue,
+                )
             )
-            < now_utc
-        ]
+        ).scalars().all()
+
+        completed_today_rows = (
+            await session.execute(
+                select(Plan).where(
+                    Plan.group_id == ctx.group_id,
+                    Plan.owner_user_id == peer_uid,
+                    Plan.status == PlanStatus.completed,
+                    Plan.updated_at >= start_of_today_utc,
+                )
+            )
+        ).scalars().all()
 
         # Notes the speaker has sent the peer recently (last 10).
         notes_res = await session.execute(
@@ -523,8 +622,12 @@ async def _peek_peer_state(ctx: ToolContext, *, peer: str) -> dict[str, Any]:
         "wechat_user_id": peer_uid,
         "display_name": display_name_for(peer_uid),
         "last_inbound_at_iso": last_inbound_at_iso,
-        "open_plans_count": len(open_plans_count),
+        # Back-compat: `open_plans_count` retained with its historical meaning
+        # (draft + active). PR-I adds explicit overdue / completed_today
+        # buckets so the LLM can see the split.
+        "open_plans_count": len(open_rows),
         "overdue_count": len(overdue_rows),
+        "completed_today_count": len(completed_today_rows),
         "recent_notes_I_sent_them": recent_notes,
     }
 
@@ -605,7 +708,11 @@ _PLAN_UPDATE_FIELDS_SCHEMA = {
         "expected_duration_per_session_min": {"type": "integer", "minimum": 1},
         "recurrence_cron": {
             "type": "string",
-            "description": "5-field crontab (m h dom mon dow). E.g. '0 20 * * 1-5'",
+            "description": (
+                "5 字段 cron: 分 时 日 月 周（m h dom mon dow）。"
+                "例：'0 20 * * 1-5' = 工作日每晚 20:00。"
+                "**不要写 6 字段（带秒）形式**，那种会被拒掉。"
+            ),
         },
         "priority": {"type": "integer"},
         "metadata_json": {
@@ -701,9 +808,26 @@ TOOL_REGISTRY: dict[str, Tool] = {
         },
         handler=_mark_plan_complete,
     ),
+    "cancel_plan": Tool(
+        name="cancel_plan",
+        description=(
+            "把计划标记为 cancelled（用户说「算了 / 取消吧 / 不做了」时用）。"
+            "会保留这一行用于审计 —— 优先于 delete_plan。delete_plan 是永久删除，"
+            "失去历史；cancel_plan 只改状态。"
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {"plan_id": {"type": "string"}},
+            "required": ["plan_id"],
+        },
+        handler=_cancel_plan,
+    ),
     "delete_plan": Tool(
         name="delete_plan",
-        description="Delete a plan by id.",
+        description=(
+            "永久删除一个计划（不可恢复）。**通常你想要的是 cancel_plan**，"
+            "除非用户明确说「删掉 / 别再出现」或需要清理误创建的草稿。"
+        ),
         parameters_schema={
             "type": "object",
             "properties": {"plan_id": {"type": "string"}},

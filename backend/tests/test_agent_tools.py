@@ -205,6 +205,8 @@ async def test_tool_schemas_shape() -> None:
         "create_plan_draft",
         "update_plan",
         "mark_plan_complete",
+        # PR-I: audit-preserving cancellation, alongside the permanent delete.
+        "cancel_plan",
         "delete_plan",
         "schedule_reminder",
         "cancel_reminder",
