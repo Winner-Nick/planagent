@@ -389,20 +389,30 @@ async def _mark_plan_complete(ctx: ToolContext, *, plan_id: str) -> dict[str, An
 
 
 async def _cancel_plan(ctx: ToolContext, *, plan_id: str) -> dict[str, Any]:
-    """Mark a plan as `cancelled`. Row is preserved for audit.
+    """Mark a plan as `cancelled` AND cancel its pending reminders.
 
     PR-I: prefer this over `delete_plan` when the user explicitly says
-    "算了 / 取消吧 / 不做了". Deleting loses history; cancelling keeps it
-    so the peer whiteboard / later "how many cancelled plans" queries are
-    answerable. Status transition is purely local (no scheduler / reminder
-    side-effects) — any pending reminders remain on disk but the overdue
-    sweep ignores non-active plans so they won't auto-flip back.
+    "算了 / 取消吧 / 不做了". Deleting loses history; cancelling keeps the
+    Plan row for audit. The scheduler dispatches pending Reminder rows
+    without checking the parent plan status, so we must also flip every
+    `pending` reminder to `cancelled` — otherwise a plan the user just
+    killed keeps nagging them.
     """
     async with ctx.session_factory() as session:
         plan = await _fetch_plan_in_group(session, ctx, plan_id)
         if plan is None:
             return {"error": "plan_not_found", "plan_id": plan_id}
         plan.status = PlanStatus.cancelled
+        # Also cancel any still-pending reminders on this plan. Already
+        # sent / skipped / cancelled ones are left alone (audit trail).
+        rres = await session.execute(
+            select(Reminder).where(
+                Reminder.plan_id == plan_id,
+                Reminder.status == ReminderStatus.pending,
+            )
+        )
+        for rem in rres.scalars().all():
+            rem.status = ReminderStatus.cancelled
         await session.commit()
         await session.refresh(plan)
         return _serialize_plan(plan)

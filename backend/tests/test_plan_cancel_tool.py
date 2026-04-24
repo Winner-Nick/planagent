@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from planagent import db as db_mod
 from planagent.agent.tools import TOOL_REGISTRY, ToolContext
-from planagent.db.models import GroupContext, Plan, PlanStatus
+from planagent.db.models import GroupContext, Plan, PlanStatus, Reminder, ReminderStatus
 from planagent.main import run_migrations
 
 
@@ -66,6 +66,65 @@ async def test_cancel_plan_sets_status_and_preserves_row(session_factory) -> Non
         still_there = await session.get(Plan, plan_id)
         assert still_there is not None
         assert still_there.status == PlanStatus.cancelled
+
+
+async def test_cancel_plan_also_cancels_pending_reminders(session_factory) -> None:
+    """Regression: cancelling a plan must flip its pending reminders to
+    cancelled. Otherwise the scheduler keeps firing them — user told us
+    to stop and we keep nagging.
+    """
+    from datetime import UTC, datetime, timedelta
+    async with session_factory() as session:
+        group = GroupContext(wechat_group_id="wx-cancel-rem", name="G")
+        session.add(group)
+        await session.flush()
+        plan = Plan(
+            group_id=group.id, title="喝水",
+            status=PlanStatus.active, owner_user_id="u-peng",
+        )
+        session.add(plan)
+        await session.flush()
+        now = datetime.now(UTC)
+        rems = [
+            Reminder(
+                plan_id=plan.id, fire_at=now + timedelta(minutes=30),
+                message="r1", status=ReminderStatus.pending,
+            ),
+            Reminder(
+                plan_id=plan.id, fire_at=now + timedelta(hours=2),
+                message="r2", status=ReminderStatus.pending,
+            ),
+            Reminder(
+                plan_id=plan.id, fire_at=now - timedelta(hours=1),
+                message="r0", status=ReminderStatus.sent,  # already fired
+            ),
+        ]
+        session.add_all(rems)
+        await session.commit()
+        group_id, plan_id = group.id, plan.id
+
+    ctx = ToolContext(
+        session_factory=session_factory,
+        group_id=group_id,
+        wechat_group_id="wx-cancel-rem",
+        wechat_send=_noop_send,
+    )
+    handler = TOOL_REGISTRY["cancel_plan"].handler
+    result = await handler(ctx, plan_id=plan_id)
+    assert result.get("status") == "cancelled"
+
+    async with session_factory() as session:
+        all_rems = (
+            await session.execute(
+                __import__("sqlalchemy").select(Reminder).where(Reminder.plan_id == plan_id)
+            )
+        ).scalars().all()
+        status_by_msg = {r.message: r.status for r in all_rems}
+    # Previously-pending reminders are now cancelled.
+    assert status_by_msg["r1"] == ReminderStatus.cancelled
+    assert status_by_msg["r2"] == ReminderStatus.cancelled
+    # Already-sent reminders are left alone (audit trail).
+    assert status_by_msg["r0"] == ReminderStatus.sent
 
 
 async def test_cancel_plan_rejects_cross_group_plan_id(session_factory) -> None:

@@ -50,13 +50,14 @@ def upgrade() -> None:
         return
     if dialect == "postgresql":
         # `ALTER TYPE ... ADD VALUE` cannot run inside a transaction on PG.
-        # Pop out to autocommit for the duration of these two statements.
-        raw = bind.connection  # type: ignore[attr-defined]
-        with raw.execution_options(isolation_level="AUTOCOMMIT"):
-            for val in _NEW_VALUES:
-                raw.exec_driver_sql(
-                    f"ALTER TYPE plan_status ADD VALUE IF NOT EXISTS '{val}'"
-                )
+        # `op.get_bind()` returns a SQLAlchemy `Connection`; `execution_options`
+        # lives on it directly. (Earlier drafts tried `bind.connection` which
+        # is the DBAPI handle and has no `execution_options` / `exec_driver_sql`.)
+        auto_bind = bind.execution_options(isolation_level="AUTOCOMMIT")
+        for val in _NEW_VALUES:
+            auto_bind.exec_driver_sql(
+                f"ALTER TYPE plan_status ADD VALUE IF NOT EXISTS '{val}'"
+            )
         return
     # Other dialects (MySQL, etc.): safest to no-op; the ORM will still
     # reject unknown values at the Python layer if the column is tightened
