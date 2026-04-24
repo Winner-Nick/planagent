@@ -63,6 +63,87 @@ When live mode cannot reach the backend the UI renders an inline
 - Messaging: WeChat ClawBot (iLink Bot API, official)
 - Tests: pytest, real API calls only (no mocks)
 
+## Running the bridge (production)
+
+The bridge is the long-running process that drives WeChat I/O, the
+scheduler, and agent turns. For day-to-day dev you can just do:
+
+```bash
+cd backend
+python -m planagent.wechat.bridge --scheduler-interval-s 300
+```
+
+On startup the bridge writes its PID to `/tmp/planagent-bridge.pid` and
+removes it on clean shutdown. `SIGTERM` triggers a graceful shutdown
+bounded by ~5 s.
+
+### Health check
+
+```bash
+python -m planagent.wechat.bridge --health-check
+```
+
+Prints a JSON summary (uptime, sessions, last inbound/outbound per
+session, open pending outbounds, scheduler liveness). Exit 0 iff the
+bridge is alive, 1 otherwise — suitable for a systemd `ExecStartPre`,
+k8s liveness probe, or cron-based watchdog.
+
+### systemd
+
+A unit template lives at [`deploy/planagent-bridge.service`](deploy/planagent-bridge.service).
+It is NOT installed automatically. Edit the `__REPLACE_WITH_*__` markers
+(user, group, repo path), then:
+
+```bash
+sudo cp deploy/planagent-bridge.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now planagent-bridge
+journalctl -u planagent-bridge -f | jq .
+```
+
+### Structured logs
+
+Every significant bridge event prints one JSON line to stderr, tagged
+with `event` + a handful of contextual fields. The contract:
+
+| event                      | fields                                                               |
+| -------------------------- | -------------------------------------------------------------------- |
+| `inbound_received`         | `session_name`, `wechat_user_id`, `text_preview`, `context_token`    |
+| `outbound_sent`            | `session_name`, `target_user_id`, `text_preview`, `client_id`        |
+| `reminder_fired`           | `plan_id`, `owner`, `fire_at`, `message_preview`                     |
+| `wakeup_decision`          | `session_name`, `should_ping`, `reason`                              |
+| `pending_outbound_flushed` | `pending_id`, `target_user_id`                                       |
+| `handler_failed`           | `session_name`, `error`, `exc_type`                                  |
+
+Use `jq` to filter:
+
+```bash
+journalctl -u planagent-bridge -f | jq -r 'select(.event=="inbound_received")'
+```
+
+### Log rotation
+
+Two options — pick one:
+
+1. **logrotate** (if you write logs to a file via `systemd`/`tee`):
+
+   ```
+   /var/log/planagent/bridge.log {
+       daily
+       rotate 14
+       compress
+       missingok
+       notifempty
+       copytruncate
+   }
+   ```
+
+2. **Python-side rotation**: call
+   `planagent.logutil.setup_json_logging(enable_file_rotation=True)`
+   (already invoked inside `main()` when you pass `PLANAGENT_LOG_TO_FILE=1`
+   — see the systemd unit). Rolls `~/.planagent/logs/bridge.log` at
+   midnight via `TimedRotatingFileHandler`, keeping 14 days of backups.
+
 ## Status
 
 Under active construction — see the open PRs for current progress.

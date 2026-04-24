@@ -1,0 +1,65 @@
+# planagent WeChat bridge — systemd unit template.
+#
+# This file is NOT installed automatically. To enable:
+#
+#   sudo cp deploy/planagent-bridge.service /etc/systemd/system/
+#   # edit the paths below to match your environment
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now planagent-bridge
+#   systemctl status planagent-bridge
+#   journalctl -u planagent-bridge -f
+#
+# Logs come out as one-JSON-line-per-event (see planagent.logutil). Pipe
+# through jq for readability, e.g.
+#
+#   journalctl -u planagent-bridge -f | jq -r 'select(.event=="inbound_received")'
+#
+# If you prefer file-based logs with daily rotation, set
+# PLANAGENT_LOG_TO_FILE=1 in the Environment= line below and the bridge
+# will also write to ~/.planagent/logs/bridge.log (rotated at midnight,
+# 14 days retained via TimedRotatingFileHandler).
+
+[Unit]
+Description=planagent WeChat bridge (multi-session)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Peng's env — EDIT THESE:
+User=__REPLACE_WITH_UNIX_USER__
+Group=__REPLACE_WITH_UNIX_GROUP__
+WorkingDirectory=__REPLACE_WITH_REPO_PATH__/backend
+Environment=PYTHONUNBUFFERED=1
+# Uncomment to ALSO write JSON logs to ~/.planagent/logs/bridge.log
+# with daily rotation (14 days retention). journalctl still captures stderr.
+# Environment=PLANAGENT_LOG_TO_FILE=1
+EnvironmentFile=__REPLACE_WITH_REPO_PATH__/.env
+
+# Use the project virtualenv Python directly so we don't depend on a
+# shell profile being loaded.
+ExecStart=__REPLACE_WITH_REPO_PATH__/.venv/bin/python -m planagent.wechat.bridge --scheduler-interval-s 300
+ExecStop=/bin/kill -SIGTERM $MAINPID
+
+# Restart on crash but not on clean exit (clean = we asked it to stop).
+Restart=on-failure
+RestartSec=5
+
+# Graceful shutdown window matches bridge's own SHUTDOWN_TIMEOUT_S (5 s)
+# plus a small cushion for DB / HTTP pool disposal.
+TimeoutStopSec=10
+
+# Bridge writes /tmp/planagent-bridge.pid on startup. We don't use
+# Type=forking + PIDFile= because the bridge runs in the foreground;
+# the PID file exists for the --health-check sub-command.
+
+# Hardening (optional but recommended for a long-running bot process):
+NoNewPrivileges=true
+PrivateTmp=false
+# PrivateTmp must stay false so the PID file at /tmp/planagent-bridge.pid
+# is visible to health-check invocations from outside the unit.
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

@@ -9,6 +9,8 @@ from dataclasses import dataclass
 
 import httpx
 
+from planagent.logutil import log_handler_failed
+
 from .client import ClawBotClient, ClawBotError
 from .protocol import InboundMessage
 
@@ -40,11 +42,14 @@ async def run_polling_loop(
     client: ClawBotClient | None = None,
     stop_event: asyncio.Event | None = None,
     backoff_s: float = 2.0,
+    session_name: str = "",
 ) -> None:
     """Loop forever (or until `stop_event`) dispatching messages to `on_message`.
 
     - Threads the cursor (`get_updates_buf`) across calls.
-    - Isolates handler exceptions so one bad message can't kill the loop.
+    - Isolates handler exceptions so one bad message can't kill the loop
+      (a DB or API error in the handler emits `handler_failed` and we
+      move on to the next inbound — the process survives).
     - On transport errors, logs and retries after a short backoff.
     """
     owns_client = client is None
@@ -64,8 +69,13 @@ async def run_polling_loop(
             for msg in resp.msgs:
                 try:
                     await on_message(msg)
-                except Exception:  # noqa: BLE001 — handler must not kill loop
+                except Exception as exc:  # noqa: BLE001 — handler must not kill loop
                     log.exception("on_message handler raised")
+                    log_handler_failed(
+                        session_name=session_name,
+                        error=str(exc),
+                        exc_type=type(exc).__name__,
+                    )
     finally:
         if owns_client:
             await c.aclose()
@@ -104,6 +114,7 @@ async def run_all_sessions(
             client=c,
             stop_event=stop,
             backoff_s=backoff_s,
+            session_name=spec.name,
         )
 
     try:
