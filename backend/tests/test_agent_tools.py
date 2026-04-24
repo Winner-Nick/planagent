@@ -217,6 +217,8 @@ async def test_tool_schemas_shape() -> None:
         "note_for_peer",
         "peek_peer_state",
         "send_to_peer_async",
+        # PR-L: one-off scheduled nudges.
+        "schedule_message_to_peer",
     }
     assert names == expected
     for s in schemas:

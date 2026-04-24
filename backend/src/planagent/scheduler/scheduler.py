@@ -40,10 +40,13 @@ from planagent.db.models import (
     PlanStatus,
     Reminder,
     ReminderStatus,
+    ScheduledMessage,
+    ScheduledMessageStatus,
 )
 from planagent.llm.deepseek import DeepSeekClient
 from planagent.scheduler.decider import BEIJING, ReminderDecision, decide
 from planagent.scheduler.wakeup import decide_wakeup
+from planagent.wechat.constants import display_name_for
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +79,16 @@ class _PendingSend:
     session_id: str | None  # BotSession.id if the reminder fans to a session
     context_token: str | None
     message: str
+
+
+@dataclass
+class _ScheduledMessageSend:
+    scheduled_message_id: str
+    bot_token: str
+    to_user_id: str
+    session_id: str
+    context_token: str | None
+    text: str
 
 
 @dataclass
@@ -210,6 +223,28 @@ class Scheduler:
                 # doesn't double-nudge right after we already sent a reminder.
                 if item.session_id is not None:
                     await self._stamp_session_outbound(item.session_id, now)
+
+        # PR-L: one-off ScheduledMessage dispatch pass. These are the
+        # "三分钟后告诉对方 X" nudges booked via `schedule_message_to_peer` —
+        # not tracked as Plans, just fire-and-forget pushes. Delivery goes
+        # to the target user's BotSession with a "[author 让我转告]" prefix
+        # so the receiver sees it as a forwarded message, not a bot ping.
+        sm_sends = await self._claim_due_scheduled_messages(now)
+        for sm in sm_sends:
+            try:
+                await self._dispatch_send(
+                    bot_token=sm.bot_token,
+                    to_user_id=sm.to_user_id,
+                    text=sm.text,
+                    context_token=sm.context_token,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "wechat_send failed for scheduled_message %s",
+                    sm.scheduled_message_id,
+                )
+            else:
+                await self._stamp_session_outbound(sm.session_id, now)
 
         # Wake-up ping pass.
         if self._enable_wakeup:
@@ -400,18 +435,42 @@ class Scheduler:
                 group: GroupContext = plan.group
                 sessions_in_group = list(group.bot_sessions or [])
                 if sessions_in_group:
-                    for bs in sessions_in_group:
-                        if not bs.wechat_user_id:
-                            continue
+                    # PR-L fix for bug #1: route reminders to the plan's owner
+                    # ONLY — not every BotSession in the logical group. The
+                    # prior fan-out caused 鹏鹏 to receive 辰辰's reminders
+                    # (and vice versa), because both sessions share the same
+                    # GroupContext. We resolve by wechat_user_id match; if
+                    # owner is NULL or owner's session isn't in the roster
+                    # yet, the reminder is still stamped `sent` (to avoid
+                    # re-claiming on the next tick) but we log and skip so
+                    # ops can see it.
+                    owner_uid = plan.owner_user_id
+                    target_bs: BotSession | None = None
+                    if owner_uid:
+                        for bs in sessions_in_group:
+                            if bs.wechat_user_id == owner_uid:
+                                target_bs = bs
+                                break
+                    if target_bs is not None and target_bs.wechat_user_id:
                         claimed.append(
                             _PendingSend(
                                 reminder_id=r.id,
-                                bot_token=bs.bot_token,
-                                to_user_id=bs.wechat_user_id,
-                                session_id=bs.id,
-                                context_token=bs.last_context_token,
+                                bot_token=target_bs.bot_token,
+                                to_user_id=target_bs.wechat_user_id,
+                                session_id=target_bs.id,
+                                context_token=target_bs.last_context_token,
                                 message=r.message,
                             )
+                        )
+                    else:
+                        log.warning(
+                            "reminder_dropped_no_owner_session "
+                            "reminder_id=%s plan_id=%s owner_user_id=%s "
+                            "sessions_in_group=%d",
+                            r.id,
+                            plan.id,
+                            owner_uid,
+                            len(sessions_in_group),
                         )
                 elif not self._send_is_per_session:
                     # Legacy path (PR-E-era DB): only safe when a 3-arg
@@ -436,6 +495,97 @@ class Scheduler:
                         r.id,
                         group.id,
                     )
+            await session.commit()
+        return claimed
+
+    async def _claim_due_scheduled_messages(
+        self, now: datetime
+    ) -> list[_ScheduledMessageSend]:
+        """Flip due `pending` ScheduledMessages to `sent` and return send jobs.
+
+        Mirrors `_claim_due_reminders`'s same claim-before-deliver pattern:
+        one tick never re-delivers a row another tick already claimed. The
+        trade-off (crash between commit + send drops a single nudge) is
+        identical to reminders and acknowledged at module level.
+
+        Delivery targets the `target_user_id`'s BotSession within the same
+        group. If no matching BotSession exists (target user never had an
+        inbound), we log + skip; the row still gets flipped so ops see the
+        drop rather than silent re-fires.
+        """
+        claimed: list[_ScheduledMessageSend] = []
+        async with self._sm() as session:
+            result = await session.execute(
+                select(ScheduledMessage).where(
+                    ScheduledMessage.status == ScheduledMessageStatus.pending,
+                    ScheduledMessage.fire_at <= now,
+                    ScheduledMessage.fired_at.is_(None),
+                )
+            )
+            rows = list(result.scalars().all())
+            if not rows:
+                return claimed
+
+            # Resolve the target BotSessions in a single pass. Group by
+            # (group_id, target_user_id) for the lookup.
+            group_ids = {r.group_id for r in rows}
+            target_uids = {r.target_user_id for r in rows}
+            bs_res = await session.execute(
+                select(BotSession).where(
+                    BotSession.group_id.in_(group_ids),
+                    BotSession.wechat_user_id.in_(target_uids),
+                )
+            )
+            bs_by_key: dict[tuple[str, str], BotSession] = {}
+            for bs in bs_res.scalars().all():
+                if bs.wechat_user_id:
+                    bs_by_key[(bs.group_id, bs.wechat_user_id)] = bs
+
+            for r in rows:
+                bs = bs_by_key.get((r.group_id, r.target_user_id))
+                if bs is None:
+                    # No target session exists — flip to sent with a log so
+                    # the row doesn't block the sweep forever. User is
+                    # unreachable; this is a hard drop.
+                    r.status = ScheduledMessageStatus.sent
+                    r.fired_at = now
+                    log.warning(
+                        "scheduled_message_dropped_no_target_session "
+                        "scheduled_message_id=%s group_id=%s target_user_id=%s",
+                        r.id,
+                        r.group_id,
+                        r.target_user_id,
+                    )
+                    continue
+                if not bs.last_context_token:
+                    # ClawBot requires a fresh context_token per send. Post-
+                    # bootstrap, the target may exist as a BotSession but
+                    # haven't messaged our bridge yet, so `last_context_token`
+                    # is NULL. Dispatching now would silently drop the
+                    # message. Leave the row pending; the next sweep (after
+                    # the target sends any inbound that stamps the token)
+                    # will pick it up.
+                    log.info(
+                        "scheduled_message_deferred_no_context_token "
+                        "scheduled_message_id=%s session_id=%s",
+                        r.id,
+                        bs.id,
+                    )
+                    continue
+                r.status = ScheduledMessageStatus.sent
+                r.fired_at = now
+                author_name = display_name_for(r.author_user_id) or "系统"
+                forwarded_text = f"[{author_name} 让我转告] {r.text}"
+                claimed.append(
+                    _ScheduledMessageSend(
+                        scheduled_message_id=r.id,
+                        bot_token=bs.bot_token,
+                        to_user_id=bs.wechat_user_id or r.target_user_id,
+                        session_id=bs.id,
+                        context_token=bs.last_context_token,
+                        text=forwarded_text,
+                    )
+                )
             await session.commit()
         return claimed
 

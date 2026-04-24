@@ -294,6 +294,63 @@ class PendingOutbound(Base):
     )
 
 
+class ScheduledMessageStatus(str, enum.Enum):  # noqa: UP042
+    """State machine for a one-off ScheduledMessage (PR-L).
+
+    - pending: inserted by `schedule_message_to_peer`, awaiting fire_at.
+    - sent: scheduler tick dispatched it to the target BotSession.
+    - cancelled: reserved for a future cancel-tool; no writer today.
+    """
+
+    pending = "pending"
+    sent = "sent"
+    cancelled = "cancelled"
+
+
+class ScheduledMessage(Base):
+    """One-off cross-user nudge with a fire_at (PR-L).
+
+    The design tension this model resolves: **"告诉对方 X 三分钟后"** is
+    intent-wise a tiny scheduled message, not a plan. Before PR-L the LLM
+    modeled it as `create_plan_draft(owner=peer) + schedule_reminder`,
+    which polluted the plan board with one-off strings like "告诉辰辰她
+    吃药了吗" and made the plan list semantically meaningless. PR-L splits
+    the two concepts:
+
+    - Plan + Reminder: persistent commitment (has a title worth tracking,
+      may recur, shows on the plan board).
+    - ScheduledMessage: fire-and-forget push at a specific wall-clock time,
+      addressed to a specific user. Never appears on the plan board.
+
+    The scheduler tick sweeps `status=pending AND fire_at<=now` rows and
+    dispatches via the target's BotSession (same 1:1 transport as reminders).
+    Delivery prefixes the text with "[{author} 让我转告] " so the receiver
+    knows it's a forwarded nudge, not a spontaneous bot ping.
+    """
+
+    __tablename__ = "scheduled_messages"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    group_id: Mapped[str] = mapped_column(
+        ForeignKey("group_contexts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    author_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    target_user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    fire_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    fired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[ScheduledMessageStatus] = mapped_column(
+        Enum(ScheduledMessageStatus, name="scheduled_message_status"),
+        default=ScheduledMessageStatus.pending,
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+
 class CrossUserNote(Base):
     """Cross-user whiteboard entry (PR-H).
 

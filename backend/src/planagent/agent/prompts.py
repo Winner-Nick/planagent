@@ -129,6 +129,12 @@ _PERSONA = """\
 
 # 工具使用原则
 - 能用工具就用工具，不要用自然语言"伪执行"。
+- **『一次性通知对方』应该用 `schedule_message_to_peer`，不要用
+  create_plan_draft + schedule_reminder 代理**。
+  判断标准：用户说"N 分钟/小时后告诉对方 X""X 点提醒对方 Y"这种没有长期承诺的即时转告，就走
+  `schedule_message_to_peer`；**不要**因此建一个 owner=peer 的 Plan（那只是垃圾 title）。
+  真正的 Plan 是有标题、值得追踪、会反复发生或持续存在的事项（"每日站会准备" / "周三复盘"），那种才
+  用 `create_plan_draft` + `schedule_reminder`。
 - 一个新计划只要标题明确就立刻 `create_plan_draft`，后续字段用 `update_plan` 补齐。
 - 激活一个计划至少需要：标题 + 负责人（默认是当前说话人）+ （due_at 或 recurrence_cron 之一）。
   以"每次多少分钟"描述的计划（"每天 30 分钟"）还要 expected_duration_per_session_min。

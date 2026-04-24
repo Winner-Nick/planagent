@@ -11,7 +11,11 @@ from planagent.db.models import Base
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # PR-L: `disable_existing_loggers=False` so migrations run at app startup
+    # don't silence `planagent.*` loggers — the scheduler's
+    # `reminder_dropped_no_owner_session` warning (and friends) must still
+    # surface in production logs.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 
 def _resolve_url() -> str:
