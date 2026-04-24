@@ -7,6 +7,7 @@ once on 5xx via tenacity; 4xx errors surface immediately.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Any
 
 import httpx
@@ -198,4 +199,10 @@ class ClawBotClient:
             token=bot_token,
             json_body=body,
         )
-        return SendMessageResponse.model_validate(data)
+        resp = SendMessageResponse.model_validate(data)
+        # Expose the generated client_id on the response so the bridge can
+        # surface it in structured logs. Stored via pydantic's `extra="allow"`.
+        with contextlib.suppress(Exception):
+            # pragma: no cover — attribute path varies across pydantic minors
+            resp.__pydantic_extra__["client_id"] = outbound.client_id  # type: ignore[index]
+        return resp

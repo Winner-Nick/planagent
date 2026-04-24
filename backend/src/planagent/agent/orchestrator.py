@@ -77,6 +77,7 @@ from planagent.db.models import (
     ReminderStatus,
 )
 from planagent.llm.deepseek import DeepSeekClient
+from planagent.logutil import log_pending_outbound_flushed
 from planagent.wechat import protocol as wxp
 from planagent.wechat.constants import display_name_for, peer_wechat_user_id
 from planagent.wechat.protocol import InboundMessage
@@ -696,6 +697,10 @@ async def _flush_pending_outbound(
             row.status = PendingOutboundStatus.delivered
             row.delivered_at = datetime.now(UTC)
             await session.commit()
+        log_pending_outbound_flushed(
+            pending_id=row_id,
+            target_user_id=target_user_id,
+        )
         delivered += 1
     return delivered
 

@@ -26,6 +26,7 @@ from planagent.agent.service import AgentService
 from planagent.agent.tools import WechatSend
 from planagent.db.models import BotSession, GroupContext, GroupMember
 from planagent.llm.deepseek import DeepSeekClient
+from planagent.logutil import log_inbound_received, log_outbound_sent
 from planagent.wechat import protocol as wxp
 from planagent.wechat.client import ClawBotClient
 from planagent.wechat.protocol import InboundMessage
@@ -39,6 +40,7 @@ def wechat_send_for(
     to_user_id: str,
     context_token: str,
     group_id: str | None = None,
+    session_name: str = "",
 ) -> WechatSend:
     """Return a wechat_send closure bound to a specific outbound destination.
 
@@ -46,18 +48,31 @@ def wechat_send_for(
     but legacy / non-ClawBot transports may thread a real group id through;
     the `build_handler` shim passes the inbound's group_id so replies stay
     in the original group thread.
+
+    `session_name` is optional metadata used only for structured logs.
     """
 
     async def _send(text: str) -> None:
         if not text or not to_user_id:
             return
-        await client.send_text(
+        resp = await client.send_text(
             bot_token,
             to_user_id=to_user_id,
             text=text,
             context_token=context_token,
             group_id=group_id,
         )
+        if getattr(resp, "ret", 0) == 0:
+            client_id = ""
+            extra = getattr(resp, "__pydantic_extra__", None) or {}
+            if isinstance(extra, dict):
+                client_id = extra.get("client_id") or ""
+            log_outbound_sent(
+                session_name=session_name,
+                target_user_id=to_user_id,
+                text=text,
+                client_id=client_id,
+            )
 
     return _send
 
@@ -151,13 +166,21 @@ def build_handler_for_session(
     if not resolved_db_id or not resolved_token:
         raise ValueError("bot_session must expose id+bot_token or be supplied explicitly")
 
+    session_name = getattr(bot_session, "name", "") or ""
+
     async def _on_message(msg: InboundMessage) -> None:
         # Fill session state + learn wechat_user_id on first inbound. The
         # orchestrator then runs against the shared logical group.
-        _, wechat_group_id = await _stamp_session_inbound(
+        wechat_user_id, wechat_group_id = await _stamp_session_inbound(
             session_factory,
             session_db_id=resolved_db_id,
             msg=msg,
+        )
+        log_inbound_received(
+            session_name=session_name,
+            wechat_user_id=wechat_user_id,
+            text=wxp.text_content(msg),
+            context_token=msg.context_token,
         )
         if wechat_group_id is None:
             return
@@ -173,6 +196,7 @@ def build_handler_for_session(
             bot_token=resolved_token,
             to_user_id=to_user_id,
             context_token=msg.context_token or "",
+            session_name=session_name,
         )
         service = AgentService(
             deepseek=deepseek,
