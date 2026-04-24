@@ -72,9 +72,14 @@ def test_friendly_accepts_utc_input() -> None:
     assert friendly(utc_dt, NOW) == "今天 15:32"
 
 
-def test_friendly_accepts_naive_input_as_shanghai() -> None:
-    naive = datetime(2026, 4, 24, 15, 32)
-    assert friendly(naive, NOW) == "今天 15:32"
+def test_friendly_treats_naive_input_as_utc() -> None:
+    """SQLite drops tzinfo on `DateTime(timezone=True)` reads; our DB values
+    are always stored as UTC. Naive datetimes must therefore be interpreted
+    as UTC (and converted to Shanghai), not assumed to already be local.
+    2026-04-24T07:32 UTC == 2026-04-24T15:32+08:00.
+    """
+    naive_utc = datetime(2026, 4, 24, 7, 32)
+    assert friendly(naive_utc, NOW) == "今天 15:32"
 
 
 def test_friendly_week_collapse_from_monday() -> None:

@@ -30,8 +30,18 @@ _WEEKDAYS = ["一", "二", "三", "四", "五", "六", "日"]
 
 
 def _to_shanghai(dt: datetime) -> datetime:
+    """Convert *dt* to Asia/Shanghai.
+
+    Naive datetimes are treated as UTC — not local — because that's what
+    comes out of SQLite for our `DateTime(timezone=True)` columns (SQLite
+    drops tzinfo on read). Interpreting naive values as Shanghai would
+    silently shift every rendered time by 8 hours against reality.
+    Callers that hold a truly-local datetime should stamp tzinfo before
+    calling this helper.
+    """
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=SHANGHAI)
+        from datetime import UTC as _UTC
+        dt = dt.replace(tzinfo=_UTC)
     return dt.astimezone(SHANGHAI)
 
 
