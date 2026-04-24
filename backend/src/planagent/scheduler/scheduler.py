@@ -60,6 +60,13 @@ LegacyGroupSend = Callable[[str, str, str | None], Awaitable[None]]
 # future are materialized on the current tick rather than deferred.
 DEFAULT_SLACK_S = 30
 
+# Grace window after `due_at` before a non-recurring active plan is auto-
+# aged to `overdue`. 10 minutes: long enough that a reminder fired right at
+# due_at and a quick user follow-up ("done") still land in `active` →
+# `completed` territory; short enough that a stale `[active] ... (已过期)`
+# row doesn't linger for hours on the whiteboard. See PR-I §B.
+OVERDUE_GRACE_S = 600
+
 
 @dataclass
 class _PendingSend:
@@ -122,6 +129,12 @@ class Scheduler:
     async def tick(self, *, interval_s: int = 300) -> None:
         now = self._now()
         window_end = now + timedelta(seconds=interval_s) + self._slack
+
+        # PR-I: age stale active plans to `overdue` BEFORE the decide pass so
+        # the volatile prompt the LLM sees in this same tick (e.g. via
+        # peek_peer_state later in an agent turn) already reflects the
+        # transition. Cheap DB-only step, no LLM.
+        await self._sweep_overdue(now)
 
         plans = await self._load_active_plans()
         members_by_group = await self._load_members(
@@ -229,6 +242,35 @@ class Scheduler:
             await self._send(to_user_id, text, context_token)  # type: ignore[arg-type, call-arg]
 
     # --- DB helpers ------------------------------------------------------
+
+    async def _sweep_overdue(self, now: datetime) -> None:
+        """Age non-recurring active plans past due_at + OVERDUE_GRACE_S to overdue.
+
+        Recurring plans (recurrence_cron set) are never auto-aged — their
+        "due" is per occurrence, not per plan. Anything user-intent-driven
+        (complete / cancel / pause) is left untouched.
+        """
+        cutoff = now - timedelta(seconds=OVERDUE_GRACE_S)
+        async with self._sm() as session:
+            result = await session.execute(
+                select(Plan).where(
+                    Plan.status == PlanStatus.active,
+                    Plan.recurrence_cron.is_(None),
+                    Plan.due_at.is_not(None),
+                    Plan.due_at < cutoff,
+                )
+            )
+            stale = list(result.scalars().all())
+            if not stale:
+                return
+            for p in stale:
+                p.status = PlanStatus.overdue
+            await session.commit()
+            log.info(
+                "overdue sweep: aged %d plan(s) to overdue (grace=%ds)",
+                len(stale),
+                OVERDUE_GRACE_S,
+            )
 
     async def _load_active_plans(self) -> list[Plan]:
         async with self._sm() as session:

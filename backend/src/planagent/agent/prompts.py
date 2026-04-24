@@ -135,9 +135,27 @@ _PERSONA = """\
 - **重要**：当你给一个计划写入了 start_at 或 due_at，必须在同一轮对话里调用 `schedule_reminder`
   把那个时间点排上。否则我（小计）就等于把这事儿弄丢了。
 - 所有对用户展示的时间一律 Asia/Shanghai（+08:00），ISO-8601 带显式时区。
+- cron 一律 5 字段：分 时 日 月 周（例：`0 20 * * 1-5`）。**不要**写 6 字段（带秒）形式。
 - 想查现有计划优先 `list_plans` / `get_plan`，不要靠记忆猜。
 - 标记完成用 `mark_plan_complete`，不要只在自然语言里说"好的，做完了"。
+- 用户说"取消 / 算了 / 不做了" → `cancel_plan`（保留记录）；**不要**用 `delete_plan`，
+  那个是永久删除，会把审计历史一起抹掉。
 - 一轮最多 6 次工具调用，早点收尾。
+
+# 计划状态语义
+- draft: 刚记下但还没齐（缺时间 / recurrence 等必要字段）。
+- active: 齐活了、正在跑。
+- completed: 用户明确说做完了 → `mark_plan_complete`。
+- cancelled: 用户说"算了 / 取消吧 / 不做了" → `cancel_plan`（不要用 delete_plan，要留痕）。
+- paused: 用户明确说"暂停"（不是发牢骚）→ `update_plan(fields={"status":"paused"})`。
+- overdue: 由 scheduler 自动扫，你不要主动标。看板里会带 ⚠️ 前缀。
+
+# 重要区别（别搞混）
+- "我不想做了" = 情绪发言，什么都别改，见"情绪发言 ≠ 指令"。
+- "我不做了 / 取消吧 / 算了" = 明确取消，调 `cancel_plan`。
+- "做完了 / 搞定了" = 调 `mark_plan_complete`。
+- 在做取消 / 完成 / 暂停之前如果句意不够明确，先用 `ask_user_in_group` 问一句确认，
+  别自己脑补意图。
 """
 
 
@@ -157,7 +175,7 @@ def _plan_schema_fragment() -> str:
                 "start_at": "ISO-8601 datetime with +08:00 tz | null",
                 "due_at": "ISO-8601 datetime with +08:00 tz | null",
                 "expected_duration_per_session_min": "integer minutes | null",
-                "recurrence_cron": "5-field cron string | null",
+                "recurrence_cron": "5-field cron: 分 时 日 月 周 (e.g. '0 20 * * 1-5') | null",
                 "priority": "integer (0 default)",
                 "metadata_json": "object (free-form, notes under .notes[])",
             },
@@ -202,8 +220,13 @@ class Whiteboard:
 
     peer_display_name: str | None = None
     peer_last_inbound_at: datetime | None = None  # rendered Asia/Shanghai
+    # PR-I split: `peer_open_plans` now counts draft+active only (prev
+    # semantics). `peer_overdue_count` is explicit. `peer_completed_today`
+    # is a fresh bucket — completions since 00:00 Asia/Shanghai. Cancelled
+    # plans are intentionally ignored (they're audit rows, not load).
     peer_open_plans: int = 0
     peer_overdue_count: int = 0
+    peer_completed_today: int = 0
     # [{kind, text, created_at_local}] — notes from peer → speaker, unconsumed.
     unconsumed_notes: list[dict[str, Any]] = field(default_factory=list)
     # {"鹏鹏": [{title, status, next_fire_at?, due_at?}], "辰辰": [...]}
@@ -224,11 +247,14 @@ class Whiteboard:
                 bits.append("最近没活跃")
             bits.append(f"活跃计划 {self.peer_open_plans}")
             if self.peer_overdue_count:
-                bits.append(f"逾期 {self.peer_overdue_count}")
+                bits.append(f"⚠️逾期 {self.peer_overdue_count}")
+            if self.peer_completed_today:
+                bits.append(f"今日完成 {self.peer_completed_today}")
             peer_line = f"对方（{self.peer_display_name}）: " + " · ".join(bits)
             if (
                 self.peer_open_plans == 0
                 and self.peer_overdue_count == 0
+                and self.peer_completed_today == 0
                 and self.peer_last_inbound_at is None
             ):
                 peer_line = f"对方（{self.peer_display_name}）: 暂无活动"
@@ -246,6 +272,9 @@ class Whiteboard:
         def _plan_line(p: dict[str, Any]) -> str:
             title = p.get("title") or "?"
             status = p.get("status") or ""
+            # PR-I: overdue plans get a ⚠️ prefix so the agent can't miss
+            # them in the whiteboard scan.
+            badge = "⚠️ " if status == "overdue" else ""
             tail_bits: list[str] = []
             if p.get("next_fire_at"):
                 tail_bits.append(f"下一次 {p['next_fire_at']}")
@@ -253,8 +282,8 @@ class Whiteboard:
                 tail_bits.append(f"ddl {p['due_at']}")
             tail = " · ".join(tail_bits)
             if tail:
-                return f"  • {title} ({status}, {tail})"
-            return f"  • {title} ({status})"
+                return f"  • {badge}{title} ({status}, {tail})"
+            return f"  • {badge}{title} ({status})"
 
         # Build chunks in reverse priority: peer line is non-negotiable; notes
         # come next; plans board is the largest and gets trimmed first.
@@ -323,7 +352,10 @@ def _plan_line(p: dict[str, Any], *, now: datetime | None = None) -> str:
     forbid reading it back to the user.
     """
     nxt = p.get("next_fire_at")
-    parts = [f"- [{p['status']}] {p['title']} (id={p['id']})"]
+    # PR-I: overdue plans get a ⚠️ prefix in the speaker's own plan block
+    # too — keeps the visual cue consistent with the whiteboard peer board.
+    badge = "⚠️ " if p.get("status") == "overdue" else ""
+    parts = [f"- [{p['status']}] {badge}{p['title']} (id={p['id']})"]
     if nxt:
         friendly_nxt: str | None
         if isinstance(nxt, datetime):
