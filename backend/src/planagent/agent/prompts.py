@@ -29,6 +29,7 @@ from datetime import datetime
 from typing import Any
 
 from planagent.db.models import PlanStatus, ReminderStatus
+from planagent.lib.friendly_time import friendly
 
 VOLATILE_MARKER = "### VOLATILE CONTEXT ###"
 # PR-H will inject a cross-user whiteboard block under this marker. Do NOT
@@ -97,6 +98,18 @@ _PERSONA = """\
   ✗ "好的鹏鹏，三分钟后（15:38）提醒你喝水 💧（已设置好提醒）"
   ✓ "收到～ 15:38 戳你喝水 💧"
 - 消息写得像你在微信跟朋友聊天：逗号 / 波浪号代替句号，短句比长句好，该停就停。
+- **别自己发明亲属/昵称**：只用「鹏鹏」「辰辰」。绝不说"乖女儿""老婆""媳妇儿""宝宝"
+  "宝贝""亲爱的""老公"之类。唯一允许的变体是对方刚用过的自称（比如辰辰说"朕"，
+  小计可以跟一句玩梗，但下一轮恢复常规）。
+- **时间说人话**：对用户显示的时间一律转成口语，禁止把 ISO 念出来。对照表：
+  - ≤ 60 min 内：`N 分钟后` / `半小时后`
+  - 今天：`今天 15:32` / `今晚 22:00` / `今早 08:30`
+  - 明天：`明天早上 10:00` / `明天晚上 21:00`
+  - 本周之内：`周五 14:00`
+  - 更远：`4 月 27 日 上午 9:00`
+  工具返回里会带一个 `next_fire_at_friendly` 字段（以及 compact list_plans 的 `next`），
+  直接用它就行。**不要在对用户的消息里 emit `2026-04-27T09:00:00+08:00` 这种形式。**
+  ISO 只在你调工具（schedule_reminder / update_plan 的 start_at / due_at）时用。
 
 # 跨用户白板（### 白板 ### 区块）
 - volatile 上下文里会带一段"白板"，汇总对方（peer）的活跃度 / 活跃计划 / 逾期数，
@@ -299,11 +312,34 @@ class GroupSnapshot:
     whiteboard: Whiteboard | None = None
 
 
-def _plan_line(p: dict[str, Any]) -> str:
+def _plan_line(p: dict[str, Any], *, now: datetime | None = None) -> str:
+    """Render one plan row for the volatile plan board.
+
+    PR-M: the line used to leak raw ISO (`next_fire_at=2026-04-27T09:00:00+08:00`)
+    which the LLM would then echo back to the user. We now render a friendly
+    form (`下一次 明天 09:50`) so the model sees exactly the string it should
+    say out loud. The raw id is still included — the LLM needs it to
+    reference a specific plan in follow-up tool calls — but prompt rules
+    forbid reading it back to the user.
+    """
     nxt = p.get("next_fire_at")
     parts = [f"- [{p['status']}] {p['title']} (id={p['id']})"]
     if nxt:
-        parts.append(f"next_fire_at={nxt}")
+        friendly_nxt: str | None
+        if isinstance(nxt, datetime):
+            friendly_nxt = friendly(nxt, now)
+        else:
+            try:
+                parsed = datetime.fromisoformat(str(nxt).replace("Z", "+00:00"))
+                friendly_nxt = friendly(parsed, now)
+            except ValueError:
+                friendly_nxt = None
+        if friendly_nxt:
+            parts.append(f"下一次 {friendly_nxt}")
+        else:
+            # Fall back to raw so at least something shows. Shouldn't fire
+            # in practice — snapshots always emit ISO.
+            parts.append(f"next_fire_at={nxt}")
     return "  ".join(parts)
 
 
@@ -311,6 +347,8 @@ def _render_plans_for(
     plans: list[dict[str, Any]],
     owner_wechat_user_id: str | None,
     display_name: str | None,
+    *,
+    now: datetime | None = None,
 ) -> str:
     if not owner_wechat_user_id:
         relevant: list[dict[str, Any]] = []
@@ -319,7 +357,7 @@ def _render_plans_for(
     label = display_name or "?"
     if not relevant:
         return f"{label}当前计划: （暂无）"
-    lines = "\n".join(_plan_line(p) for p in relevant)
+    lines = "\n".join(_plan_line(p, now=now) for p in relevant)
     return f"{label}当前计划:\n{lines}"
 
 
@@ -341,10 +379,10 @@ def _render_volatile(snapshot: GroupSnapshot, now: datetime) -> str:
     for uid, name in by_uid.items():
         if uid == snapshot.speaker_wechat_user_id:
             continue
-        peer_blocks.append(_render_plans_for(snapshot.plans, uid, name))
+        peer_blocks.append(_render_plans_for(snapshot.plans, uid, name, now=now))
 
     speaker_block = _render_plans_for(
-        snapshot.plans, snapshot.speaker_wechat_user_id, speaker_label
+        snapshot.plans, snapshot.speaker_wechat_user_id, speaker_label, now=now
     )
 
     chunks = [

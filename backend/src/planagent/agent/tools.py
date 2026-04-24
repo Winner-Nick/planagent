@@ -31,6 +31,7 @@ from planagent.db.models import (
     Reminder,
     ReminderStatus,
 )
+from planagent.lib.friendly_time import friendly
 from planagent.wechat.constants import (
     CHENCHEN,
     PENG,
@@ -82,7 +83,31 @@ class Tool:
 # --- Serialization helpers ----------------------------------------------------
 
 
+def _friendly_or_none(dt: datetime | None) -> str | None:
+    """Render ``dt`` via `friendly()` if set, else None.
+
+    `friendly()` uses the current wall clock in Shanghai as `now` by default;
+    that's good enough for tool results — the LLM will regenerate user-facing
+    text in the same turn, so a <1s drift vs. turn-start `now` is invisible.
+    """
+    if dt is None:
+        return None
+    return friendly(dt)
+
+
+def _pick_plan_next_dt(p: Plan) -> datetime | None:
+    """Best-effort "what time should the user think of for this plan" pick.
+
+    start_at wins (it's the concrete fire point), else due_at. Recurrence
+    cron is intentionally NOT expanded here — it belongs to the scheduler
+    and varies per-owner; flattening it to a single friendly string would
+    lie to the LLM about what the plan actually looks like.
+    """
+    return p.start_at or p.due_at
+
+
 def _serialize_plan(p: Plan) -> dict[str, Any]:
+    next_dt = _pick_plan_next_dt(p)
     return {
         "id": p.id,
         "group_id": p.group_id,
@@ -91,6 +116,9 @@ def _serialize_plan(p: Plan) -> dict[str, Any]:
         "status": p.status.value if isinstance(p.status, PlanStatus) else p.status,
         "start_at": p.start_at.isoformat() if p.start_at else None,
         "due_at": p.due_at.isoformat() if p.due_at else None,
+        # PR-M: human-readable render of start_at/due_at. LLM MUST echo this
+        # form to the user instead of the raw ISO fields above.
+        "next_fire_at_friendly": _friendly_or_none(next_dt),
         "expected_duration_per_session_min": p.expected_duration_per_session_min,
         "recurrence_cron": p.recurrence_cron,
         "priority": p.priority,
@@ -98,6 +126,57 @@ def _serialize_plan(p: Plan) -> dict[str, Any]:
         "metadata_json": dict(p.metadata_json or {}),
         "created_at": p.created_at.isoformat() if p.created_at else None,
         "updated_at": p.updated_at.isoformat() if p.updated_at else None,
+    }
+
+
+# PR-M: a small rotating pool of one-liner cheers. The handler picks one
+# round-robin (see _cheer_counter) and returns it as METADATA — the LLM
+# decides whether/how to surface it in the user-visible reply.
+_CHEERS: tuple[str, ...] = (
+    "抓住啦 ✓",
+    "搞定 ✓",
+    "拿下 ✓",
+    "这件收工 ✓",
+    "干净利落 ✓",
+)
+_cheer_counter: dict[str, int] = {"i": 0}
+
+
+def _next_cheer() -> str:
+    i = _cheer_counter["i"] % len(_CHEERS)
+    _cheer_counter["i"] += 1
+    return _CHEERS[i]
+
+
+def _owner_short(owner_user_id: str | None) -> str | None:
+    """Map a raw wechat_user_id to 'peng' / 'chenchen', else None.
+
+    list_plans uses this to hand the LLM a stable short owner key without
+    ever exposing the raw id.
+    """
+    if owner_user_id == PENG.wechat_user_id:
+        return "peng"
+    if owner_user_id == CHENCHEN.wechat_user_id:
+        return "chenchen"
+    return None
+
+
+def _serialize_plan_compact(p: Plan) -> dict[str, Any]:
+    """Skinny Plan dict for list views.
+
+    - No raw ids exposed as free text (we keep `id` but the description on
+      the tool steers the LLM to NOT echo it).
+    - No ISO timestamps in the visible summary — only the friendly render.
+    - `owner` is a short string ("peng"/"chenchen"/None) rather than the
+      raw wechat_user_id.
+    """
+    next_dt = _pick_plan_next_dt(p)
+    return {
+        "id": p.id,
+        "title": p.title,
+        "status": p.status.value if isinstance(p.status, PlanStatus) else p.status,
+        "next": _friendly_or_none(next_dt),
+        "owner": _owner_short(p.owner_user_id),
     }
 
 
@@ -145,6 +224,9 @@ async def _fetch_plan_in_group(session, ctx: ToolContext, plan_id: str) -> Plan 
 async def _list_plans(
     ctx: ToolContext, *, status: str | None = None
 ) -> list[dict[str, Any]]:
+    # PR-M: compact shape only. The old full-Plan payload was causing the
+    # LLM to recite raw UUIDs and ISO stamps back at the user. If the agent
+    # needs the full fields it MUST call `get_plan(plan_id=...)` explicitly.
     async with ctx.session_factory() as session:
         stmt = (
             select(Plan)
@@ -154,7 +236,7 @@ async def _list_plans(
         if status is not None:
             stmt = stmt.where(Plan.status == PlanStatus(status))
         res = await session.execute(stmt)
-        return [_serialize_plan(p) for p in res.scalars().all()]
+        return [_serialize_plan_compact(p) for p in res.scalars().all()]
 
 
 async def _get_plan(ctx: ToolContext, *, plan_id: str) -> dict[str, Any]:
@@ -233,7 +315,16 @@ async def _mark_plan_complete(ctx: ToolContext, *, plan_id: str) -> dict[str, An
         plan.status = PlanStatus.completed
         await session.commit()
         await session.refresh(plan)
-        return _serialize_plan(plan)
+        # PR-M: ship a "cheer" hint alongside the raw ok. It's metadata —
+        # the LLM may echo it, rephrase it, or drop it entirely. The point
+        # is that confirming a completion should feel warm, not curt.
+        return {
+            "ok": True,
+            "plan_id": plan.id,
+            "title": plan.title,
+            "status": plan.status.value,
+            "cheer": _next_cheer(),
+        }
 
 
 async def _delete_plan(ctx: ToolContext, *, plan_id: str) -> dict[str, Any]:
@@ -532,7 +623,13 @@ _PLAN_UPDATE_FIELDS_SCHEMA = {
 TOOL_REGISTRY: dict[str, Tool] = {
     "list_plans": Tool(
         name="list_plans",
-        description="List plans for the current group, optionally filtered by status.",
+        description=(
+            "列出当前 group 的计划（概览版，不是完整字段）。"
+            "返回数组，每项只含 {id, title, status, next, owner}，"
+            "其中 next 已经是口语化时间（如「明天 09:50」），owner 是"
+            "短名（peng / chenchen / null）。**不要把 id 念给用户听**，"
+            "id 只用于下一步调工具。需要完整 Plan 字段时才调 get_plan。"
+        ),
         parameters_schema={
             "type": "object",
             "properties": {
@@ -592,7 +689,11 @@ TOOL_REGISTRY: dict[str, Tool] = {
     ),
     "mark_plan_complete": Tool(
         name="mark_plan_complete",
-        description="Mark a plan as completed.",
+        description=(
+            "把一个计划标记为已完成。返回 {ok, plan_id, title, status, cheer}；"
+            "`cheer` 是一句你可以顺手带进回复里的小庆祝词（类似「搞定 ✓」），"
+            "不是强制的，不合适就忽略。"
+        ),
         parameters_schema={
             "type": "object",
             "properties": {"plan_id": {"type": "string"}},
