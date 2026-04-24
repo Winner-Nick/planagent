@@ -147,11 +147,17 @@ def setup_json_logging(
             )
 
     # Third-party noise: httpx logs every HTTP request at INFO. For a
-    # bot that long-polls every ~15s, that's a line per cycle per
+    # bot that long-polls every ~15s that's a line per cycle per
     # session — drowns real events. Raise to WARNING so only genuine
-    # failures surface. Do the same for httpcore.
+    # failures surface. Same for httpcore. DON'T override callers that
+    # already picked a stricter level (e.g. `setup_json_logging(ERROR)`
+    # or debug runs that set httpx=DEBUG explicitly) — only tighten
+    # the level when the current setting would still emit INFO.
     for noisy in ("httpx", "httpcore"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
+        noisy_logger = logging.getLogger(noisy)
+        current = noisy_logger.getEffectiveLevel()
+        if current < logging.WARNING:
+            noisy_logger.setLevel(logging.WARNING)
 
 
 def log_event(event: str, *, level: int = logging.INFO, **fields: Any) -> None:
