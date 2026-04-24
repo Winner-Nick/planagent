@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -86,6 +86,12 @@ log = logging.getLogger(__name__)
 MAX_ROUNDS = 10
 HISTORY_TURNS = 20
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+# PR-L: inbound dedup window. WeChat retries and bridge restarts with
+# overlapping cursors can redeliver an inbound with the same context_token.
+# Scanning recent rows is cheap (ConversationTurn is small, bounded) and we
+# don't want an index on context_token (~200 bytes).
+_INBOUND_DEDUP_WINDOW = timedelta(minutes=5)
 
 SPOKEN_TOOL_NAMES = {"reply_in_group", "ask_user_in_group"}
 
@@ -312,6 +318,41 @@ async def _load_history_for_speaker(
                 }
             )
     return messages
+
+
+async def _inbound_is_duplicate(
+    session_factory: async_sessionmaker,
+    *,
+    group_id: str,
+    speaker_user_id: str | None,
+    context_token: str | None,
+    now: datetime,
+    window: timedelta = _INBOUND_DEDUP_WINDOW,
+) -> bool:
+    """Return True if a ConversationTurn matching this inbound already exists.
+
+    Matching fields: (speaker_user_id, context_token) within the last `window`.
+    We intentionally scan rather than index — `context_token` is wide (~200
+    bytes per row) and the recent-turn set is small enough that a filtered
+    SELECT over (group_id, role=user, recency) is cheap. No token = no dedup
+    signal, so the caller MUST still guard against null tokens.
+    """
+    if not context_token or not speaker_user_id:
+        return False
+    cutoff = now - window
+    async with session_factory() as session:
+        res = await session.execute(
+            select(ConversationTurn.id)
+            .where(
+                ConversationTurn.group_id == group_id,
+                ConversationTurn.role == ConversationRole.user,
+                ConversationTurn.user_id == speaker_user_id,
+                ConversationTurn.context_token == context_token,
+                ConversationTurn.created_at >= cutoff,
+            )
+            .limit(1)
+        )
+        return res.first() is not None
 
 
 async def _append_turn(
@@ -608,7 +649,15 @@ async def _flush_pending_outbound(
             .order_by(PendingOutbound.created_at.asc())
         )
         rows = list(res.scalars().all())
-        pending = [(r.id, r.text) for r in rows]
+        # PR-L (fixes bug #4): tag each forwarded message with "[{author}
+        # 让我转告] " so the recipient sees it as a forwarded nudge, not a
+        # spontaneous bot message. System-originated rows (no author) get
+        # a "[系统] " tag.
+        pending: list[tuple[str, str]] = []
+        for r in rows:
+            author_name = display_name_for(r.author_user_id) if r.author_user_id else None
+            prefix = f"[{author_name} 让我转告] " if author_name else "[系统] "
+            pending.append((r.id, prefix + r.text))
 
     delivered = 0
     for row_id, text in pending:
@@ -664,6 +713,27 @@ async def handle_inbound(
         wechat_group_id=wechat_group_id,
         wechat_user_id=speaker_user_id,
     )
+
+    # PR-L (fixes bug #3): reject duplicates BEFORE persisting a user turn or
+    # flushing pending outbound. WeChat retries / bridge restarts with an
+    # overlapping cursor re-deliver the same InboundMessage; without this
+    # guard we'd run the full agent loop twice, pay DeepSeek twice, and
+    # spam the user.
+    if await _inbound_is_duplicate(
+        session_factory,
+        group_id=group_internal_id,
+        speaker_user_id=speaker_user_id,
+        context_token=msg.context_token,
+        now=datetime.now(UTC),
+    ):
+        log.info(
+            "inbound_duplicate_skipped group_id=%s speaker_user_id=%s "
+            "context_token=%s",
+            group_internal_id,
+            speaker_user_id,
+            msg.context_token,
+        )
+        return
 
     # Persist the inbound as the FIRST turn for this handler invocation. Note
     # both speaker and target are the same for user rows.

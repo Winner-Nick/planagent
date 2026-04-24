@@ -30,6 +30,8 @@ from planagent.db.models import (
     PlanStatus,
     Reminder,
     ReminderStatus,
+    ScheduledMessage,
+    ScheduledMessageStatus,
 )
 from planagent.lib.friendly_time import friendly
 from planagent.wechat.constants import (
@@ -680,6 +682,55 @@ async def _send_to_peer_async(
         }
 
 
+async def _schedule_message_to_peer(
+    ctx: ToolContext,
+    *,
+    peer: str,
+    fire_at: str,
+    text: str,
+) -> dict[str, Any]:
+    """Queue a one-off wall-clock nudge to the other human (PR-L).
+
+    Dichotomy vs. create_plan_draft+schedule_reminder: use THIS when the user
+    says "N 分钟后告诉对方 X" and there is no persistent commitment to track.
+    The scheduler delivers at `fire_at` via the target's BotSession, prefixing
+    with "[{author} 让我转告] ". No Plan row is created.
+    """
+    peer_uid = _resolve_peer_key(peer)
+    if not peer_uid:
+        return {"error": "unknown_peer", "detail": peer}
+    if not ctx.sender_user_id:
+        return {"error": "no_sender_context"}
+    if peer_uid == ctx.sender_user_id:
+        return {"error": "peer_is_speaker"}
+    stripped = (text or "").strip()
+    if not stripped:
+        return {"error": "empty_text"}
+    try:
+        fire_at_utc = _parse_iso_to_utc(fire_at)
+    except (ValueError, TypeError) as exc:
+        return {"error": "invalid_fire_at", "detail": str(exc)}
+    async with ctx.session_factory() as session:
+        row = ScheduledMessage(
+            group_id=ctx.group_id,
+            author_user_id=ctx.sender_user_id,
+            target_user_id=peer_uid,
+            fire_at=fire_at_utc,
+            text=stripped,
+            status=ScheduledMessageStatus.pending,
+        )
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+        return {
+            "scheduled": True,
+            "scheduled_message_id": row.id,
+            "fire_at": row.fire_at.isoformat(),
+            "target": peer,
+            "note": "will be delivered to peer at fire_at with a forwarded-from prefix.",
+        }
+
+
 async def _record_note(ctx: ToolContext, *, plan_id: str, note: str) -> dict[str, Any]:
     async with ctx.session_factory() as session:
         plan = await _fetch_plan_in_group(session, ctx, plan_id)
@@ -967,6 +1018,36 @@ TOOL_REGISTRY: dict[str, Tool] = {
             "required": ["peer"],
         },
         handler=_peek_peer_state,
+    ),
+    "schedule_message_to_peer": Tool(
+        name="schedule_message_to_peer",
+        description=(
+            "在未来某个时间，给对方（peer）发一条一次性消息。"
+            "用于『三分钟后告诉辰辰 X』这种即时 nudge，不会留 Plan 痕迹。"
+            "比起 create_plan_draft + schedule_reminder 代理路径，这个工具"
+            "更干净：不会污染计划板、也不会长期占着 Plan 列表。"
+            "fire_at 要 ISO-8601，带 +08:00 时区；text 就是要转告的原话。"
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "peer": {
+                    "type": "string",
+                    "enum": ["peng", "chenchen"],
+                    "description": "要发给谁（对方的短名）。",
+                },
+                "fire_at": {
+                    "type": "string",
+                    "description": "ISO-8601 带 +08:00 的触发时间。",
+                },
+                "text": {
+                    "type": "string",
+                    "description": "要转告对方的文本（一条消息）。",
+                },
+            },
+            "required": ["peer", "fire_at", "text"],
+        },
+        handler=_schedule_message_to_peer,
     ),
     "send_to_peer_async": Tool(
         name="send_to_peer_async",
