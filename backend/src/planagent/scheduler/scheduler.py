@@ -542,10 +542,13 @@ class Scheduler:
                     bs_by_key[(bs.group_id, bs.wechat_user_id)] = bs
 
             for r in rows:
-                r.status = ScheduledMessageStatus.sent
-                r.fired_at = now
                 bs = bs_by_key.get((r.group_id, r.target_user_id))
                 if bs is None:
+                    # No target session exists — flip to sent with a log so
+                    # the row doesn't block the sweep forever. User is
+                    # unreachable; this is a hard drop.
+                    r.status = ScheduledMessageStatus.sent
+                    r.fired_at = now
                     log.warning(
                         "scheduled_message_dropped_no_target_session "
                         "scheduled_message_id=%s group_id=%s target_user_id=%s",
@@ -554,6 +557,23 @@ class Scheduler:
                         r.target_user_id,
                     )
                     continue
+                if not bs.last_context_token:
+                    # ClawBot requires a fresh context_token per send. Post-
+                    # bootstrap, the target may exist as a BotSession but
+                    # haven't messaged our bridge yet, so `last_context_token`
+                    # is NULL. Dispatching now would silently drop the
+                    # message. Leave the row pending; the next sweep (after
+                    # the target sends any inbound that stamps the token)
+                    # will pick it up.
+                    log.info(
+                        "scheduled_message_deferred_no_context_token "
+                        "scheduled_message_id=%s session_id=%s",
+                        r.id,
+                        bs.id,
+                    )
+                    continue
+                r.status = ScheduledMessageStatus.sent
+                r.fired_at = now
                 author_name = display_name_for(r.author_user_id) or "系统"
                 forwarded_text = f"[{author_name} 让我转告] {r.text}"
                 claimed.append(

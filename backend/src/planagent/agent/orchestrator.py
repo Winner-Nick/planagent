@@ -329,20 +329,27 @@ async def _inbound_is_duplicate(
     now: datetime,
     window: timedelta = _INBOUND_DEDUP_WINDOW,
 ) -> bool:
-    """Return True if a ConversationTurn matching this inbound already exists.
+    """Return True if this inbound was ALREADY HANDLED successfully.
 
-    Matching fields: (speaker_user_id, context_token) within the last `window`.
-    We intentionally scan rather than index — `context_token` is wide (~200
-    bytes per row) and the recent-turn set is small enough that a filtered
-    SELECT over (group_id, role=user, recency) is cheap. No token = no dedup
-    signal, so the caller MUST still guard against null tokens.
+    Codex P1 (PR-L) surfaced this subtlety: `handle_inbound` persists the
+    user turn BEFORE running the LLM/tool/send loop. If the first attempt
+    crashed mid-loop (transient DeepSeek / transport error), the user turn
+    is on disk but nothing was ever sent back. A naive
+    "(speaker, context_token) within window exists → skip" check would
+    then silently drop the platform's retry.
+
+    Correct dedup: a prior attempt is considered *successfully handled*
+    only if a subsequent `assistant` turn with `target_user_id == speaker`
+    landed after the user turn. No such trailing assistant row → the first
+    pass bailed, so the retry should re-run.
     """
     if not context_token or not speaker_user_id:
         return False
     cutoff = now - window
     async with session_factory() as session:
-        res = await session.execute(
-            select(ConversationTurn.id)
+        # Find the most-recent user turn matching this inbound.
+        user_res = await session.execute(
+            select(ConversationTurn.id, ConversationTurn.created_at)
             .where(
                 ConversationTurn.group_id == group_id,
                 ConversationTurn.role == ConversationRole.user,
@@ -350,9 +357,25 @@ async def _inbound_is_duplicate(
                 ConversationTurn.context_token == context_token,
                 ConversationTurn.created_at >= cutoff,
             )
+            .order_by(ConversationTurn.created_at.desc())
             .limit(1)
         )
-        return res.first() is not None
+        prior = user_res.first()
+        if prior is None:
+            return False
+        prior_created_at = prior[1]
+        # Look for an assistant reply that landed AFTER the prior user turn.
+        ack_res = await session.execute(
+            select(ConversationTurn.id)
+            .where(
+                ConversationTurn.group_id == group_id,
+                ConversationTurn.role == ConversationRole.assistant,
+                ConversationTurn.target_user_id == speaker_user_id,
+                ConversationTurn.created_at > prior_created_at,
+            )
+            .limit(1)
+        )
+        return ack_res.first() is not None
 
 
 async def _append_turn(
