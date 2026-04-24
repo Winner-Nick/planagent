@@ -146,6 +146,13 @@ def setup_json_logging(
                 "file log rotation disabled: cannot open log dir"
             )
 
+    # Third-party noise: httpx logs every HTTP request at INFO. For a
+    # bot that long-polls every ~15s, that's a line per cycle per
+    # session — drowns real events. Raise to WARNING so only genuine
+    # failures surface. Do the same for httpcore.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
 
 def log_event(event: str, *, level: int = logging.INFO, **fields: Any) -> None:
     """Emit a structured event line.
