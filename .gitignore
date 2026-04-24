@@ -1,6 +1,7 @@
 .env
 .env.*
 !.env.example
+!.env.development
 
 __pycache__/
 *.pyc
