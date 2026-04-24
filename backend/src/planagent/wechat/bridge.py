@@ -308,11 +308,38 @@ async def _run(args: BridgeArgs) -> None:
         )
         tasks = [scheduler_task, poller_task]
         try:
-            await stop.wait()
+            # Wait for either the stop signal OR any child task finishing —
+            # if scheduler or poller raises, we must exit (previously we
+            # only waited on `stop`, so a crashed child left the bridge
+            # process up but non-functional; --health-check kept reporting
+            # alive because the PID existed, masking the outage).
+            stop_task = asyncio.create_task(stop.wait(), name="stop_wait")
+            done, _pending = await asyncio.wait(
+                [scheduler_task, poller_task, stop_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            reason = None
+            for t in done:
+                if t is stop_task:
+                    reason = "stop_event"
+                    continue
+                exc = t.exception()
+                if exc is not None:
+                    log_event(
+                        "bridge_child_task_failed",
+                        task=t.get_name(),
+                        exc_type=type(exc).__name__,
+                        exc=str(exc)[:200],
+                    )
+                    reason = f"{t.get_name()}_failed"
+                else:
+                    reason = f"{t.get_name()}_completed"
+            stop_task.cancel()
         finally:
             log_event(
                 "bridge_shutdown_begin",
                 timeout_seconds=SHUTDOWN_TIMEOUT_S,
+                reason=locals().get("reason", "unknown"),
             )
             # Cancel any in-flight long-poll / DB await so everyone gets
             # a CancelledError and unwinds their finally blocks.

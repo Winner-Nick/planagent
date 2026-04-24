@@ -58,9 +58,16 @@ class JSONFormatter(logging.Formatter):
         }
         payload = getattr(record, "payload", None)
         if isinstance(payload, dict):
-            base["event"] = payload.pop("event", "log")
-            # Event fields win over any accidental collisions in base.
-            base.update(payload)
+            # Do NOT mutate `payload` — the same LogRecord can be formatted
+            # by multiple handlers (stderr + rotating file, tests capturing
+            # via caplog, etc.). A previous `payload.pop("event")` would
+            # leave the second handler with `event="log"`, silently
+            # breaking the structured-log contract on one of the sinks.
+            base["event"] = payload.get("event", "log")
+            for k, v in payload.items():
+                if k == "event":
+                    continue
+                base[k] = v
         else:
             base["event"] = "log"
             base["message"] = record.getMessage()
