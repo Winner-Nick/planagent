@@ -1,7 +1,7 @@
 """0007_scheduled_messages
 
 Revision ID: 0007_scheduled_messages
-Revises: 0005_cross_user_notes
+Revises: 0006_plan_status_overdue_cancelled
 Create Date: 2026-04-23 20:00:00.000000
 
 PR-L: add the `scheduled_messages` table that backs `schedule_message_to_peer`.
@@ -12,9 +12,8 @@ PR-L that intent was modeled as `create_plan_draft(owner=peer) +
 schedule_reminder`, which polluted the plan board with throwaway titles.
 Splitting the concept keeps Plan rows meaningful.
 
-Migration number: intentionally 0007 (skipping 0006) per PR-L plan. There
-was no 0006 landed on main at the time of writing; renumber-on-rebase if a
-conflict surfaces.
+Chained onto 0006_plan_status_overdue_cancelled (PR-I) — this PR was
+originally authored against 0005 but rebased on top of PR-I before merge.
 """
 
 from __future__ import annotations
@@ -27,7 +26,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "0007_scheduled_messages"
-down_revision: str | None = "0005_cross_user_notes"
+down_revision: str | None = "0006_plan_status_overdue_cancelled"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
